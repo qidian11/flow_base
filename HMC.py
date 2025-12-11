@@ -4,16 +4,17 @@ import math
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+from networkx.algorithms.tournament import hamiltonian_path
 
 CONFIG = {
     'L': 14,
     'm2': -4.0,
     'lam': 5.113,
-    'tao': 1,
+    'tao': 0.6,
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 10000,
+    'n_samples': 1000,
     'batch_size': 64,
 }
 
@@ -50,15 +51,23 @@ def leap_frog(phi, p, tao):
             break
         p_new = p_new + epsilon * get_force(phi_new)
     p_new = p_new + epsilon / 2 * get_force(phi_new)
+
     return phi_new, p_new
+
+
+def reverse_leapfrog(phi, p, tao):
+    return leap_frog(phi, -p, tao)
 
 
 def HMC_step(phi, p, tao, i):
     hamiltonian = calculate_hamiltonian(phi, p)
     phi_new, p_new = leap_frog(phi, p, tao)
-    print(phi_new.isnan().any())
-    nan_positions = torch.isnan(phi_new).nonzero()
-    print(nan_positions)
+    phi_reverse,p_reverse = reverse_leapfrog(phi_new, p_new, tao)
+    reverse_hamiltonian = calculate_hamiltonian(phi_reverse, p_reverse)
+    hamiltonian_ensemble.append(reverse_hamiltonian-hamiltonian)
+    # print(phi_new.isnan().any())
+    # nan_positions = torch.isnan(phi_new).nonzero()
+    # print(nan_positions)
     new_hamiltonian = calculate_hamiltonian(phi_new, p_new)
     delta_hamiltonian = new_hamiltonian - hamiltonian
     prob = torch.exp(-delta_hamiltonian)
@@ -118,46 +127,32 @@ def calculate_G_t_list(ensemble):
 
     return torch.stack(G_t_list)
 
-def compute_zero_momentum_Gt(ensemble):
-    # ensemble: tensor shape (n_saves, batch, 1, L_time, L_space)
-    # return Gt: shape (L_time,) with Gtilde_c(0,t) (connected) averaged over chains & samples
-    n_saves, batch, _, L_time, L_space = ensemble.shape
-    phi = ensemble.squeeze(2)  # (n_saves, batch, L_time, L_space)
 
-    Gt = []
-    # overall mean phi (scalar) for disconnected subtraction
-    mean_phi = phi.mean(dim=(0,1,2,3))  # scalar
-    for t in range(L_time):
-        phi_shifted = torch.roll(phi, shifts=(t, 0), dims=(2,3))
-        prod = phi * phi_shifted  # (n_saves, batch, L_time, L_space)
-        # average over spatial sites (space dim) and also average over base time positions:
-        # For zero-momentum, we sum/avg over spatial coordinate only and average over starting site y (time+space).
-        # Here we average over both time+space positions to match often-used convention:
-        prod_mean = prod.mean(dim=(2,3))  # (n_saves, batch)
-        corr = prod_mean.mean(dim=1).mean(dim=0)  # scalar
-        # disconnected piece:
-        conn = corr - mean_phi * mean_phi
-        Gt.append(conn)
-    return torch.stack(Gt)  # (L_time,)
+hamiltonian_torch = torch.randn(CONFIG['batch_size'])
+hamiltonian_ensemble = []
 
 def main():
-    phi = torch.randn(CONFIG['batch_size'], 1, CONFIG['L'], CONFIG['L'])
+    phi = torch.randn(CONFIG['batch_size'], 1, CONFIG['L'], CONFIG['L'],dtype=torch.float64)
     print(phi.isnan().any())
     ensemble = []
+
     for i in range(CONFIG['thermal_steps']):
-        p = torch.randn(CONFIG['batch_size'], 1, CONFIG['L'], CONFIG['L'])
+        p = torch.randn(CONFIG['batch_size'], 1, CONFIG['L'], CONFIG['L'],dtype=torch.float64)
         phi_new = HMC_step(phi, p, CONFIG['tao'], i)
-        if phi.isnan().any(): continue
+        # if phi.isnan().any(): continue
         phi = phi_new
     for i in range(CONFIG['n_samples']):
-        p = torch.randn(CONFIG['batch_size'], 1, CONFIG['L'], CONFIG['L'])
+        p = torch.randn(CONFIG['batch_size'], 1, CONFIG['L'], CONFIG['L'],dtype=torch.float64)
         phi_new = HMC_step(phi, p, CONFIG['tao'], i)
-        if phi.isnan().any(): continue
+        # if phi.isnan().any(): continue
         phi = phi_new
         if i % CONFIG['save_steps'] == 0:
             ensemble.append(phi.clone().detach())
     ensemble_tensor = torch.stack(ensemble, dim=0)
-
+    hamiltonian_ensemble_tensor = torch.cat(hamiltonian_ensemble).reshape(-1)
+    print(hamiltonian_ensemble_tensor.shape)
+    plt.plot(hamiltonian_ensemble_tensor.numpy())
+    plt.show()
     G_t = calculate_G_t_list(ensemble_tensor)
     # G_t = compute_zero_momentum_Gt(ensemble_tensor)
     plt.plot(G_t.numpy(),marker='o')
