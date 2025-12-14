@@ -10,11 +10,11 @@ CONFIG = {
     'L': 14,
     'm2': -4.0,
     'lam': 5.113,
-    'tao': 0.6,
-    'leap_frog_step': 10,
+    'tao': 1.2,
+    'leap_frog_step': 20,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 1000,
+    'n_samples': 3000,
     'batch_size': 64,
 }
 
