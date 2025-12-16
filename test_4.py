@@ -12,13 +12,12 @@ CONFIG = {
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 1000,
+    'n_samples': 10000,
     'bin_size': 100,
     'bootstrap_time': 1000
-    # 'batch_size': 1,  <-- 已移除，代码现在纯粹是单链 2D 张量操作
 }
 
-# 确保使用双精度
+
 DTYPE = torch.float64
 
 
@@ -122,16 +121,16 @@ def HMC_step_single_chain(phi, tao):
     delta_H = hamiltonian_new - hamiltonian_old
 
     if torch.isnan(delta_H) or torch.isinf(delta_H):
-        return phi, delta_inverse_H, 10000, False, False
+        return phi, delta_inverse_H, False, False
 
     # 3. Metropolis 接受/拒绝
     prob = torch.exp(-delta_H).item()
     rand_num = torch.rand(1).item()
 
     if rand_num < prob:
-        return phi_new, delta_inverse_H, prob, True, True
+        return phi_new, delta_inverse_H, True, True
     else:
-        return phi, delta_inverse_H, prob, True, False
+        return phi, delta_inverse_H, True, False
 
 
 def calculate_G_t_list_inside_bin(binning_ensemble):
@@ -146,10 +145,13 @@ def calculate_G_t_list_inside_bin(binning_ensemble):
             expected_phi_shifted = get_expected_phi(torch.roll(binning_ensemble, shifts=(t, l), dims=(2, 3)))
             conn = conn_2_point - expected_phi*expected_phi_shifted
             G_t_l_list.append(conn)
-        G_t_mean = torch.stack(G_t_l_list).mean(dim=(1, 2))
+        G_t_mean = torch.stack(G_t_l_list, dim=1)
+        print(f"inside calculate_G_t_list_inside_bin, "
+              f"G_t_mean's shape:{G_t_mean.shape}")
+        G_t_mean = G_t_mean.mean(dim=(1, 2))
         G_t_list.append(G_t_mean)
 
-    return torch.stack(G_t_list)  # shape: N_bin, t
+    return torch.stack(G_t_list, dim=1)  # shape: N_bin, t
 
 
 def get_correlation_for_single_configuration(binning_ensemble, time_shift, space_shift):
@@ -214,12 +216,11 @@ def main():
     # 初始化：直接生成 [L, L]
     phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
     delta_inverse_hamiltonian_list = []
-    exp_hamiltonian_list = []
     # 预热 (Thermalization)
     print("Start Thermalization...")
     step = 0
     while step < CONFIG['thermal_steps']:
-        phi, inverse_hamiltonian, exp_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, inverse_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
 
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
@@ -238,14 +239,14 @@ def main():
     accept_count = 0
 
     while step < CONFIG['n_samples']:
-        phi, inverse_hamiltonian, exp_hamiltonian,  success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, inverse_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
 
         if not success:
             print(f"Sample Step {step}: NaN detected! Retrying...")
             continue
 
         delta_inverse_hamiltonian_list.append(inverse_hamiltonian)
-        exp_hamiltonian_list.append(exp_hamiltonian)
+
         if accepted:
             accept_count += 1
 
@@ -272,24 +273,14 @@ def main():
     plt.xlabel("index")
     plt.ylabel("delta hamiltonian")
     plt.show()
-    print(exp_hamiltonian_list)
-    exp_hamiltonian_tensor = torch.tensor(exp_hamiltonian_list)
-    # exp_hamiltonian
-    y = exp_hamiltonian_tensor.mean().numpy()
-    x = 1
-    print(y)
-    plt.figure()
-    plt.plot(x, y, marker='o', linestyle='None')
-    plt.xlabel("index")
-    plt.ylabel("exp of -delta hamiltonian")
-    plt.show()
+
     # shape=(N_bin, bin_size, time, space)
     binning_ensemble = binning(ensemble_tensor)
 
     try:
         # shape: N_bin, t
         G_t_inside_bin = calculate_G_t_list_inside_bin(binning_ensemble)
-
+        print(f"G_t_inside_bin's shape:{G_t_inside_bin.shape}")
         # shape=(bootsraptime, N_bin, time)
         bootstrap_tensor = []
         for i in range(CONFIG['bootstrap_time']):
