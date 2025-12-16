@@ -1,5 +1,7 @@
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 # --- 配置 ---
 CONFIG = {
@@ -11,6 +13,8 @@ CONFIG = {
     'save_steps': 10,
     'thermal_steps': 1000,
     'n_samples': 3000,
+    'bin_size': 100,
+    'bootstrap_time': 1000
     # 'batch_size': 1,  <-- 已移除，代码现在纯粹是单链 2D 张量操作
 }
 
@@ -92,59 +96,113 @@ def HMC_step_single_chain(phi, tao):
     """
     输入 phi shape: [L, L]
     """
-    # 1. 重新采样动量，形状直接为 [L, L]
+    # 1. get new p, shape = [L, L]
     p = torch.randn(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
 
     hamiltonian_old = calculate_hamiltonian(phi, p)
 
-    # 2. Leapfrog 演化
+    # 2. Leapfrog
     phi_new, p_new = leap_frog(phi, p, tao)
 
-    # --- NaN 检测 ---
+    # 3. inverse leapfrog
+    phi_inverse, p_inverse = leap_frog(phi_new, -p_new, tao)
+    hamiltonian_inverse = calculate_hamiltonian(phi_inverse, p_inverse)
+
+    delta_inverse_H = hamiltonian_inverse - hamiltonian_old
+    # --- NaN check ---
     if torch.isnan(phi_new).any() or torch.isinf(phi_new).any():
-        return phi, False, False
+        return phi, delta_inverse_H, False, False
 
     hamiltonian_new = calculate_hamiltonian(phi_new, p_new)
 
-    # 计算能量差
+    # calculate delta H
     delta_H = hamiltonian_new - hamiltonian_old
 
     if torch.isnan(delta_H) or torch.isinf(delta_H):
-        return phi, False, False
+        return phi, delta_inverse_H, False, False
 
     # 3. Metropolis 接受/拒绝
     prob = torch.exp(-delta_H).item()
     rand_num = torch.rand(1).item()
 
     if rand_num < prob:
-        return phi_new, True, True
+        return phi_new, delta_inverse_H, True, True
     else:
-        return phi, True, False
+        return phi, delta_inverse_H, True, False
 
 
-def calculate_G_t_list(ensemble):
+def calculate_G_t_list_inside_bin(binning_ensemble):
+    G_t_list = []
+
+    for t in range(CONFIG['L']):
+        G_t_l_list = []
+        for l in range(CONFIG['L']):
+            # conn = get_connected_2_point_correlation(ensemble, t, l)
+            conn_2_point = get_correlation_for_single_configuration(binning_ensemble, t, l)
+            expected_phi = get_expected_phi(binning_ensemble)
+            expected_phi_shifted = get_expected_phi(torch.roll(binning_ensemble, shifts=(t, l), dims=(2, 3)))
+            conn = conn_2_point - expected_phi*expected_phi_shifted
+            G_t_l_list.append(conn)
+        G_t_mean = torch.stack(G_t_l_list).mean(dim=(1, 2))
+        G_t_list.append(G_t_mean)
+
+    return torch.stack(G_t_list)  # shape: N_bin, t
+
+
+def get_correlation_for_single_configuration(binning_ensemble, time_shift, space_shift):
+    ensemble_shifted = torch.roll(binning_ensemble, shifts=(time_shift, space_shift), dims=(2, 3))
+    binning_ensemble_corr = ensemble_shifted * binning_ensemble
+    binning_ensemble_corr_mean = binning_ensemble_corr.mean(dim=(2, 3))
+    return binning_ensemble_corr_mean
+
+
+def get_correlation_from_single_configuration(binning_ensemble):
+    return binning_ensemble.main(dims=(0, 1))
+
+
+def get_expected_phi(binning_ensemble):
+    expected_phi = binning_ensemble.mean(dim=(0, 1))
+    expected_phi = expected_phi.mean(dim=(0, 1))
+    return expected_phi
+
+
+def get_effective_mass(G_t):
     """
-    计算 G(t)。
-    ensemble shape: [N_samples, L, L]
-    (已经去除了 Batch 和 Channel)
+    输入 G_t: [..., L]
+    输出 m_eff: [..., L]
     """
-    N, L, _ = ensemble.shape
-    G_t = []
+    # 1. 利用 roll 处理周期性边界，计算全量 L 个点
+    G_plus = torch.roll(G_t, shifts=-1, dims=-1)
+    G_minus = torch.roll(G_t, shifts=1, dims=-1)
 
-    # 假设 dim 1 是时间 T，dim 2 是空间 X
-    # phi_mean_spatial shape: [N, T]
-    phi_mean_spatial = ensemble.mean(dim=2)
-    phi_bar = phi_mean_spatial.mean()  # 全局平均值
+    # 2. 核心公式
+    # 加上 1e-10 防止除零
+    cosh_m = (G_plus + G_minus) / (2 * G_t + 1e-10)
 
-    for t in range(L):
-        corrs = []
-        for t0 in range(L):
-            t_next = (t0 + t) % L
-            val = (phi_mean_spatial[:, t_next] - phi_bar) * (phi_mean_spatial[:, t0] - phi_bar)
-            corrs.append(val.mean())
-        G_t.append(torch.tensor(corrs).mean())
+    # 3. Clamp 防止 NaN (保底)
+    cosh_m = torch.clamp(cosh_m, min=1.0)
 
-    return torch.stack(G_t)
+    # 4. 计算反双曲余弦
+    m_eff = torch.acosh(cosh_m)
+
+    return m_eff
+
+
+def binning(data):
+    N_bin = data.shape[0] // CONFIG['bin_size']
+    data = data[:N_bin * CONFIG['bin_size']]
+    data = data.view(N_bin, CONFIG['bin_size'], *data.shape[1:])
+    return data
+
+
+def bootstrap(data):
+    N_bin = data.shape[0]
+    lst = []
+    for i in range(N_bin):
+        idx = torch.randint(0, data.size(0), (1,))
+        lst.append(data[idx.item()])
+    bootstrap_ensemble = torch.stack(lst)
+    return bootstrap_ensemble
 
 
 def main():
@@ -152,12 +210,12 @@ def main():
 
     # 初始化：直接生成 [L, L]
     phi = torch.randn(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
-
+    delta_inverse_hamiltonian_list = []
     # 预热 (Thermalization)
     print("Start Thermalization...")
     step = 0
     while step < CONFIG['thermal_steps']:
-        phi, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, inverse_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
 
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
@@ -176,11 +234,13 @@ def main():
     accept_count = 0
 
     while step < CONFIG['n_samples']:
-        phi, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, inverse_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
 
         if not success:
             print(f"Sample Step {step}: NaN detected! Retrying...")
             continue
+
+        delta_inverse_hamiltonian_list.append(inverse_hamiltonian)
 
         if accepted:
             accept_count += 1
@@ -197,17 +257,89 @@ def main():
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
+    print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
+    # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
+    # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
+    y = np.array([x.item() for x in delta_inverse_hamiltonian_list])
+    x = torch.arange(len(y))
+
+    plt.figure()
+    plt.plot(x, y)
+    plt.xlabel("index")
+    plt.ylabel("delta hamiltonian")
+    plt.show()
+
+    # shape=(N_bin, bin_size, time, space)
+    binning_ensemble = binning(ensemble_tensor)
 
     try:
-        G_t = calculate_G_t_list(ensemble_tensor)
+        # shape: N_bin, t
+        G_t_inside_bin = calculate_G_t_list_inside_bin(binning_ensemble)
 
-        plt.figure(figsize=(8, 6))
-        plt.plot(G_t.numpy(), marker='o', linestyle='-')
-        plt.yscale('log')
-        plt.xlabel('Time Separation (t)')
-        plt.ylabel('G(t) (Connected)')
-        plt.title(f'2-point function (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
-        plt.grid(True, which="both", ls="--")
+        # shape=(bootsraptime, N_bin, time)
+        bootstrap_tensor = []
+        for i in range(CONFIG['bootstrap_time']):
+            bootstrap_tensor.append(bootstrap(G_t_inside_bin))
+
+        # green function
+        # shape=(bootsraptime, time)
+        bootstrap_tensor = torch.stack(bootstrap_tensor).mean(dim=1)
+
+        G_error_bar = bootstrap_tensor.std(dim=0)
+        y_err_g = G_error_bar.numpy()
+        G_t = G_t_inside_bin.mean(dim=0)
+
+        # effective mass
+        # shape=(time)
+        effective_mass = get_effective_mass(G_t)
+        effective_mass = effective_mass[1:-1]
+        bootstrap_effective_mass = get_effective_mass(bootstrap_tensor)
+        bootstrap_effective_mass = bootstrap_effective_mass[:, 1:-1]
+        e_m_error_bar = bootstrap_effective_mass.std(dim=0)
+        y_err_m = e_m_error_bar.numpy()
+        # plt
+        fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+
+        # green function
+        # axs[0].plot(G_t.numpy(), np.arange(CONFIG['L']), marker='o', linestyle='-')
+        axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
+        axs[0].errorbar(
+            np.arange(len(G_t.numpy())),
+            G_t.numpy(),
+            yerr=y_err_g,
+            fmt='-o',  # 格式字符串: '-'代表连线, 'o'代表画点
+            color='blue',  # 线和点的颜色
+            ecolor='purple',  # error bar 的颜色 (设为不同颜色方便看清)
+            capsize=4,  # 误差棒两端“帽子”横线的宽度
+            elinewidth=1.5,  # 误差棒线条的粗细
+            label='Lattice Data'  # 图例标签
+        )
+        axs[0].set_yscale('log')
+        axs[0].set_xlabel('Time Separation (t)')
+        axs[0].set_ylabel('G(t) (Connected)')
+        axs[0].set_title(f'2-point function (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
+        axs[0].grid(True, which="both", ls="--")
+
+        # effective mass
+        # axs[1].plot(effective_mass.numpy(), np.arange(1, CONFIG['L']-1), marker='o', linestyle='-')
+        axs[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+        axs[1].errorbar(
+            np.arange(len(e_m_error_bar.numpy())),
+            effective_mass.numpy(),
+            yerr=y_err_m,
+            fmt='-o',  # 格式字符串: '-'代表连线, 'o'代表画点
+            color='blue',  # 线和点的颜色
+            ecolor='purple',  # error bar 的颜色 (设为不同颜色方便看清)
+            capsize=4,  # 误差棒两端“帽子”横线的宽度
+            elinewidth=1.5,  # 误差棒线条的粗细
+            label='Lattice Data'  # 图例标签
+        )
+        axs[1].set_xlabel('Time Separation (t)')
+        axs[1].set_ylabel('effective mass')
+        axs[1].set_title(f'effective mass (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
+        # axs[1].grid(True, which="both", ls="--")
+
+        plt.tight_layout()
         plt.show()
     except Exception as e:
         print(f"Plotting error: {e}")
