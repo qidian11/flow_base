@@ -109,7 +109,7 @@ def HMC_step_single_chain(phi, tao):
     # 3. inverse leapfrog
     phi_inverse, p_inverse = leap_frog(phi_new, -p_new, tao)
     delta_phi = phi - phi_inverse
-    delta_p = p - p_inverse
+    delta_p = p + p_inverse
     hamiltonian_inverse = calculate_hamiltonian(phi_inverse, p_inverse)
 
     delta_inverse_H = hamiltonian_inverse - hamiltonian_old
