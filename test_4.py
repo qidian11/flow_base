@@ -12,7 +12,7 @@ CONFIG = {
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 10000,
+    'n_samples': 100000,
     'bin_size': 100,
     'bootstrap_time': 1000
 }
@@ -108,12 +108,14 @@ def HMC_step_single_chain(phi, tao):
 
     # 3. inverse leapfrog
     phi_inverse, p_inverse = leap_frog(phi_new, -p_new, tao)
+    delta_phi = phi - phi_inverse
+    delta_p = p - p_inverse
     hamiltonian_inverse = calculate_hamiltonian(phi_inverse, p_inverse)
 
     delta_inverse_H = hamiltonian_inverse - hamiltonian_old
     # --- NaN check ---
     if torch.isnan(phi_new).any() or torch.isinf(phi_new).any():
-        return phi, delta_inverse_H, False, False
+        return phi, delta_inverse_H, delta_phi, delta_p, False, False
 
     hamiltonian_new = calculate_hamiltonian(phi_new, p_new)
 
@@ -121,16 +123,16 @@ def HMC_step_single_chain(phi, tao):
     delta_H = hamiltonian_new - hamiltonian_old
 
     if torch.isnan(delta_H) or torch.isinf(delta_H):
-        return phi, delta_inverse_H, False, False
+        return phi, delta_H, delta_inverse_H, delta_phi, delta_p, False, False
 
     # 3. Metropolis 接受/拒绝
     prob = torch.exp(-delta_H).item()
     rand_num = torch.rand(1).item()
 
     if rand_num < prob:
-        return phi_new, delta_inverse_H, True, True
+        return phi_new, delta_H, delta_inverse_H, delta_phi, delta_p, True, True
     else:
-        return phi, delta_inverse_H, True, False
+        return phi, delta_H, delta_inverse_H, delta_phi, delta_p, True, False
 
 
 def calculate_G_t_list_inside_bin(binning_ensemble):
@@ -146,8 +148,8 @@ def calculate_G_t_list_inside_bin(binning_ensemble):
             conn = conn_2_point - expected_phi*expected_phi_shifted
             G_t_l_list.append(conn)
         G_t_mean = torch.stack(G_t_l_list, dim=1)
-        print(f"inside calculate_G_t_list_inside_bin, "
-              f"G_t_mean's shape:{G_t_mean.shape}")
+        # print(f"inside calculate_G_t_list_inside_bin, "
+        #       f"G_t_mean's shape:{G_t_mean.shape}")
         G_t_mean = G_t_mean.mean(dim=(1, 2))
         G_t_list.append(G_t_mean)
 
@@ -207,6 +209,7 @@ def bootstrap(data):
         idx = torch.randint(0, data.size(0), (1,))
         lst.append(data[idx.item()])
     bootstrap_ensemble = torch.stack(lst)
+    # print(f"bootstrap_ensemble shape:{bootstrap_ensemble.shape}")
     return bootstrap_ensemble
 
 
@@ -215,12 +218,15 @@ def main():
 
     # 初始化：直接生成 [L, L]
     phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
+    delta_H_list = []
     delta_inverse_hamiltonian_list = []
+    delta_phi_list = []
+    delta_p_list = []
     # 预热 (Thermalization)
     print("Start Thermalization...")
     step = 0
     while step < CONFIG['thermal_steps']:
-        phi, inverse_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
 
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
@@ -239,14 +245,16 @@ def main():
     accept_count = 0
 
     while step < CONFIG['n_samples']:
-        phi, inverse_hamiltonian, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
 
         if not success:
             print(f"Sample Step {step}: NaN detected! Retrying...")
             continue
 
+        delta_H_list.append(delta_H)
         delta_inverse_hamiltonian_list.append(inverse_hamiltonian)
-
+        delta_phi_list.append(delta_phi)
+        delta_p_list.append(delta_p)
         if accepted:
             accept_count += 1
 
@@ -261,7 +269,11 @@ def main():
     # 处理数据
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
+    delta_H_tensor = torch.stack(delta_H_list, dim=0)
+    delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
+    delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
+    print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
     print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
     # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
     # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
@@ -274,9 +286,40 @@ def main():
     plt.ylabel("delta hamiltonian")
     plt.show()
 
+    # delta_phi
+    y = np.array([x.item() for x in delta_phi_list_tensor.mean(dim=(1,2)).cpu().numpy()])
+    x = torch.arange(len(y))
+
+    plt.figure()
+    plt.plot(x, y)
+    plt.xlabel("index")
+    plt.ylabel("delta phi")
+    plt.show()
+
+    # delta_p
+    y = np.array([x.item() for x in delta_p_list_tensor.mean(dim=(1,2)).cpu().numpy()])
+    x = torch.arange(len(y))
+
+    plt.figure()
+    plt.plot(x, y)
+    plt.xlabel("index")
+    plt.ylabel("delta p")
+    plt.show()
+
     # shape=(N_bin, bin_size, time, space)
     binning_ensemble = binning(ensemble_tensor)
-
+    phi_to_1 = binning_ensemble.mean()
+    phi_to_2 = (binning_ensemble * binning_ensemble).mean()
+    phi_to_3 = (binning_ensemble **3).mean()
+    phi_to_4 = (binning_ensemble ** 4).mean()
+    phi_to_5 = (binning_ensemble ** 5).mean()
+    print("delta_H: {:.2e}".format(delta_H_tensor.mean().item()))
+    print("expectation of exp delta_h: {:.2e}".format(torch.exp(-delta_H_tensor).mean().item()))
+    print(f"phi_to_1:{phi_to_1:.2e}")
+    print(f"phi_to_2:{phi_to_2:.2e}")
+    print(f"phi_to_3:{phi_to_3:.2e}")
+    print(f"phi_to_4:{phi_to_4:.2e}")
+    print(f"phi_to_5:{phi_to_5:.2e}")
     try:
         # shape: N_bin, t
         G_t_inside_bin = calculate_G_t_list_inside_bin(binning_ensemble)
@@ -289,7 +332,7 @@ def main():
         # green function
         # shape=(bootsraptime, time)
         bootstrap_tensor = torch.stack(bootstrap_tensor).mean(dim=1)
-
+        print(f"bootstrap_tensor's shape:{bootstrap_tensor.shape}")
         G_error_bar = bootstrap_tensor.std(dim=0)
         y_err_g = G_error_bar.numpy()
         G_t = G_t_inside_bin.mean(dim=0)

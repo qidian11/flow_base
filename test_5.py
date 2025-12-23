@@ -8,58 +8,124 @@ CONFIG = {
     'L': 14,
     'm2': -4.0,
     'lam': 5.113,
-    'delta': 0.5,  # Local Metropolis 步长
+    'delta': 0.5,  # Metropolis step size
     'save_steps': 1000,
-    'thermal_steps': 1000,
-    'n_samples': 14000,
-    'bin_size': 100,      # 已移除，直接计算
-    'bootstrap_time': 1000  # 已移除
+    'thermal_steps': 100000,
+    'n_samples': 1000000000,
+    'bin_size': 100,
+    'bootstrap_time': 1000
 }
 
 # 确保使用双精度
 DTYPE = torch.float64
 
 
-def local_metropolis_sweep(phi):
+def checkerboard_metropolis_sweep(phi):
     """
-    Local Metropolis 算法：逐点更新
+    Checkerboard (Red-Black) Metropolis Algorithm.
+
+    Instead of updating sites one by one sequentially, we divide the lattice into
+    "Red" (even) and "Black" (odd) sites, similar to a chessboard.
+
+    1. Update all Red sites simultaneously (vectorized). Their neighbors are Black sites,
+       which are fixed during this step.
+    2. Update all Black sites simultaneously. Their neighbors are Red sites,
+       which were just updated.
+
+    This allows for massive parallelization using PyTorch tensors.
     """
     L = CONFIG['L']
-    accepted_hits = 0
-    total_sites = L * L
-
-    # 提取参数避免重复查询
     m2 = CONFIG['m2']
     lam = CONFIG['lam']
     delta = CONFIG['delta']
 
-    for i in range(L):
-        for j in range(L):
-            phi_old = phi[i, j]
+    # 1. Create Masks for Red (Even) and Black (Odd) sites
+    # Coordinate grid: i corresponds to row, j to column
+    coords = torch.arange(L, device=phi.device)
+    i, j = torch.meshgrid(coords, coords, indexing='ij')
 
-            # 周期性边界获取邻居
-            up = phi[(i - 1) % L, j]
-            down = phi[(i + 1) % L, j]
-            left = phi[i, (j - 1) % L]
-            right = phi[i, (j + 1) % L]
-            neighbor_sum = up + down + left + right
+    # Red sites: i + j is even
+    mask_red = (i + j) % 2 == 0
+    # Black sites: i + j is odd
+    mask_black = (i + j) % 2 == 1
 
-            # 提议新值
-            change = (torch.rand(1, dtype=DTYPE) - 0.5) * 2 * delta
-            phi_new = phi_old + change.item()
+    total_accepted = 0
+    total_sites = L * L
 
-            # 计算局部 Action 变化
-            S_old_local = (4 + m2) * phi_old ** 2 + lam * phi_old ** 4 - phi_old * neighbor_sum
-            S_new_local = (4 + m2) * phi_new ** 2 + lam * phi_new ** 4 - phi_new * neighbor_sum
+    # Helper function to calculate sum of neighbors using matrix rolling
+    # torch.roll automatically handles periodic boundary conditions
+    def get_neighbor_sum(current_phi):
+        up = torch.roll(current_phi, shifts=1, dims=0)
+        down = torch.roll(current_phi, shifts=-1, dims=0)
+        left = torch.roll(current_phi, shifts=1, dims=1)
+        right = torch.roll(current_phi, shifts=-1, dims=1)
+        return up + down + left + right
 
-            delta_S = S_new_local - S_old_local
+    # ==========================
+    # PHASE 1: Update Red Sites
+    # ==========================
 
-            # Metropolis 判据
-            if delta_S < 0 or torch.rand(1).item() < torch.exp(-delta_S):
-                phi[i, j] = phi_new
-                accepted_hits += 1
+    # Calculate neighbors (neighbors of Red are Black, which are currently fixed)
+    neighbor_sum = get_neighbor_sum(phi)
 
-    return phi, accepted_hits, total_sites
+    # Propose new values for the entire grid
+    # (We calculate for all, but will only apply changes to Red sites)
+    change = (torch.rand_like(phi, dtype=DTYPE) - 0.5) * 2 * delta
+    phi_proposal = phi + change
+
+    # Calculate local Action (S) for old and new configurations
+    # S_local = (4 + m^2) * phi^2 + lambda * phi^4 - phi * neighbor_sum
+    term1 = (4 + m2)
+
+    S_old = term1 * phi ** 2 + lam * phi ** 4 - phi * neighbor_sum
+    S_new = term1 * phi_proposal ** 2 + lam * phi_proposal ** 4 - phi_proposal * neighbor_sum
+
+    delta_S = S_new - S_old
+
+    # Metropolis Criterion
+    # Accept if delta_S < 0 OR exp(-delta_S) > random(0, 1)
+    random_prob = torch.rand_like(phi, dtype=DTYPE)
+    accept_condition = (delta_S < 0) | (torch.exp(-delta_S) > random_prob)
+
+    # Combine: Must be a Red Site AND satisfy Metropolis criterion
+    update_mask = mask_red & accept_condition
+
+    # Update phi tensor only at accepted Red sites
+    phi = torch.where(update_mask, phi_proposal, phi)
+
+    # Count accepted hits for statistics
+    total_accepted += update_mask.sum().item()
+
+    # ============================
+    # PHASE 2: Update Black Sites
+    # ============================
+
+    # Recalculate neighbors because Red sites have changed!
+    neighbor_sum = get_neighbor_sum(phi)
+
+    # Propose new values
+    change = (torch.rand_like(phi, dtype=DTYPE) - 0.5) * 2 * delta
+    phi_proposal = phi + change
+
+    # Calculate Action change
+    S_old = term1 * phi ** 2 + lam * phi ** 4 - phi * neighbor_sum
+    S_new = term1 * phi_proposal ** 2 + lam * phi_proposal ** 4 - phi_proposal * neighbor_sum
+
+    delta_S = S_new - S_old
+
+    # Metropolis Criterion
+    random_prob = torch.rand_like(phi, dtype=DTYPE)
+    accept_condition = (delta_S < 0) | (torch.exp(-delta_S) > random_prob)
+
+    # Combine: Must be a Black Site AND satisfy Metropolis criterion
+    update_mask = mask_black & accept_condition
+
+    # Update phi tensor only at accepted Black sites
+    phi = torch.where(update_mask, phi_proposal, phi)
+
+    total_accepted += update_mask.sum().item()
+
+    return phi, total_accepted, total_sites
 
 
 def calculate_G_t(ensemble):
@@ -85,7 +151,6 @@ def calculate_G_t(ensemble):
 
     # shape=(time)
     return torch.stack(G_t_list).mean(dim=(1, 2))
-
 
 
 def get_2_point_correlation(ensemble, time_shift, space_shift):
@@ -120,6 +185,7 @@ def get_effective_mass(G_t):
     return m_eff
 
 
+
 def calculate_G_t_list_inside_bin(binning_ensemble):
     G_t_list = []
 
@@ -135,7 +201,7 @@ def calculate_G_t_list_inside_bin(binning_ensemble):
         G_t_mean = torch.stack(G_t_l_list, dim=1)
         print(f"inside calculate_G_t_list_inside_bin, "
               f"G_t_mean's shape:{G_t_mean.shape}")
-        # Average drop position direction: 2 and bin_size: 1
+        # Average drop position direction: 1 and bin_size: 2
         G_t_mean = G_t_mean.mean(dim=(1, 2))
         G_t_list.append(G_t_mean)
 
@@ -163,21 +229,22 @@ def bootstrap(data):
         idx = torch.randint(0, data.size(0), (1,))
         lst.append(data[idx.item()])
     bootstrap_ensemble = torch.stack(lst)
-    print(f"bootstrap_ensemble shape:{bootstrap_ensemble.shape}")
+    # print(f"bootstrap_ensemble shape:{bootstrap_ensemble.shape}")
     return bootstrap_ensemble
 
 
 def main():
-    print(f"Config: L={CONFIG['L']}, Delta={CONFIG['delta']} (Local Metropolis, No Binning)")
+    print(f"Config: L={CONFIG['L']}, Delta={CONFIG['delta']} (Checkerboard Metropolis)")
 
     # 初始化
-    phi = torch.randn(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
+    phi = torch.ones(CONFIG['L'], CONFIG['L'], dtype=DTYPE) * 0.6
 
     # 预热 (Thermalization)
     print("Start Thermalization...")
     step = 0
     while step < CONFIG['thermal_steps']:
-        phi, accepted, total = local_metropolis_sweep(phi)
+        # Changed to checkerboard_metropolis_sweep
+        phi, accepted, total = checkerboard_metropolis_sweep(phi)
         step += 1
         if step % 100 == 0:
             print(f"Thermal Step {step}/{CONFIG['thermal_steps']} (Acc: {accepted / total:.2f})")
@@ -190,7 +257,8 @@ def main():
     total_count = 0
 
     while step < CONFIG['n_samples']:
-        phi, accepted, total = local_metropolis_sweep(phi)
+        # Changed to checkerboard_metropolis_sweep
+        phi, accepted, total = checkerboard_metropolis_sweep(phi)
         total_acc += accepted
         total_count += total
 
@@ -208,10 +276,9 @@ def main():
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
+    print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
+    # shape=(N_bin, bin_size, time, space)
     binning_ensemble = binning(ensemble_tensor)
-    print(f"Binning shape: {binning_ensemble.shape}")
-
-    binning_G_t = calculate_G_t(binning_ensemble)
     try:
         # 1. calculate G(t)
         # 这里传入的是 Raw Data [Samples, L, L]，函数内部已适配
@@ -230,8 +297,7 @@ def main():
         G_error_bar = bootstrap_tensor.std(dim=0)
         y_err_g = G_error_bar.numpy()
         G_t = G_t_inside_bin.mean(dim=0)
-
-
+        print(f"G_t: {G_t}")
         # 2. calculate effective mass
         effective_mass = get_effective_mass(G_t)
 
