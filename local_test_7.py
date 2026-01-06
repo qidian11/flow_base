@@ -9,15 +9,15 @@ CONFIG = {
     'm2': -4.0,
     'lam': 5.113,
     'delta': 0.5,
-    'save_steps': 10,  # 自相关时间短，10步足够
+    'save_steps': 10,
     'thermal_steps': 5000,
-    'n_samples': 100000,
+    'n_samples': 2000000,
     'bin_size': 100,
     'bootstrap_time': 1000
 }
 
-# [FIX 1] 必须使用 float64，否则 exp(-dS) 精度不够
-DTYPE = torch.float64
+
+DTYPE = torch.float32
 
 
 def checkerboard_metropolis_optimized(phi):
@@ -174,7 +174,7 @@ def main():
 
         step += 1
         if step % 10000 == 0:
-            print(f"Step {step}/{CONFIG['n_samples']}, Acc: {total_acc / (total * 10000 / CONFIG['save_steps']):.2%}")
+            print(f"Step {step}/{CONFIG['n_samples']}, Acc: {total_acc / (total * 10000):.2%}")
             total_acc = 0
 
     # 分析
@@ -207,7 +207,7 @@ def main():
     # Mass plot (trim edges)
     axs[1].errorbar(t_axis[1:-1], m_mean.numpy()[1:-1], yerr=m_err.numpy()[1:-1], fmt='-o', color='red', capsize=3)
     axs[1].set_title('Effective Mass')
-    axs[1].set_ylim(0, 1)  # 预期质量应该在这个范围内
+    # axs[1].set_ylim(0, 1)  # 预期质量应该在这个范围内
 
     plt.tight_layout()
     plt.show()

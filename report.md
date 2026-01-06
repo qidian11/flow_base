@@ -1,6 +1,6 @@
 # 1. Reproduction Experiments and Results
 
-To establish a verified baseline for evaluating the generative models, we first reproduced the Hybrid Monte Carlo (HMC) algorithm for the two-dimensional scalar $\phi^4$ theory. [cite_start]We selected the parameter set $E5$ from Table I of the reference paper ($L=14$, $m^2=-4.0$, $\lambda=5.113$ [cite: 203]), which targets a physical line of constant $m_p L \approx 4$.
+To establish a verified baseline for evaluating the generative models, we first reproduced the Hybrid Monte Carlo (HMC) algorithm for the two-dimensional scalar $\phi^4$ theory. We selected the parameter set $E5$ from Table I of the reference paper ($L=14$, $m^2=-4.0$, $\lambda=5.113$ [cite: 203]), which targets a physical line of constant $m_p L \approx 4$.
 
 ## 1.1. HMC Implementation
 
@@ -34,7 +34,7 @@ We generated $10,000$ configurations after a thermalization period of $1,000$ st
 
 ## 1.3. Physical Observables
 
-[cite_start]To verify the correctness of the generated ensemble, we computed the zero-momentum two-point Green's function $\tilde{G}_c(0, t)$ and the effective pole mass $m^{eff}_p(t)$, defined as[cite: 360]:
+To verify the correctness of the generated ensemble, we computed the zero-momentum two-point Green's function $\tilde{G}_c(0, t)$ and the effective pole mass $m^{eff}_p(t)$, defined as[cite: 360]:
 
 $$
 m_{p}^{eff}(t) = \text{arccosh}\left( \frac{\tilde{G}_c(0, t+1) + \tilde{G}_c(0, t-1)}{2\tilde{G}_c(0, t)} \right)
@@ -83,7 +83,7 @@ As a benchmark for Critical Slowing Down (CSD), we employ the Local Metropolis s
     $$
     \phi'(x) = \phi(x) + \delta, \quad \delta \sim U(-\Delta, \Delta)
     $$
-    [cite_start]The width $\Delta$ is tuned to achieve an acceptance rate of approximately 70%[cite: 351]. The proposal is accepted with probability:
+    The width $\Delta$ is tuned to achieve an acceptance rate of approximately 70%[cite: 351]. The proposal is accepted with probability:
     $$
     P_{acc} = \min(1, e^{-\Delta S_{loc}})
     $$
@@ -91,10 +91,10 @@ As a benchmark for Critical Slowing Down (CSD), we employ the Local Metropolis s
 
 ## 2.2. Flow-based MCMC (Proposed Method)
 
-[cite_start]The core method utilizes a normalizing flow model to generate independent global proposals, as detailed in Section II of the reference[cite: 44].
+The core method utilizes a normalizing flow model to generate independent global proposals, as detailed in Section II of the reference[cite: 44].
 
 ### 2.2.1. Model Architecture
-[cite_start]We utilize the RealNVP architecture, which constructs a bijective map $f: z \to \phi$ using Affine Coupling Layers[cite: 121]. [cite_start]A single layer splits the input into two partitions $(x_a, x_b)$ and transforms one partition based on the other[cite: 125]:
+We utilize the RealNVP architecture, which constructs a bijective map $f: z \to \phi$ using Affine Coupling Layers[cite: 121]. A single layer splits the input into two partitions $(x_a, x_b)$ and transforms one partition based on the other[cite: 125]:
 
 $$
 \begin{aligned}
@@ -106,17 +106,22 @@ $$
 where $s(\cdot)$ and $t(\cdot)$ are neural networks. This structure ensures the Jacobian determinant is easily computable.
 
 ### 2.2.2. Training Objective
-[cite_start]The model is trained to minimize the shifted Kullback-Leibler (KL) divergence between the model distribution $\tilde{p}_f(\phi)$ and the target Boltzmann distribution $p(\phi)$[cite: 143]:
+The model is trained to minimize the shifted Kullback-Leibler (KL) divergence between the model distribution $\tilde{p}_f(\phi)$ and the target Boltzmann distribution $p(\phi)$[cite: 143]:
 
 $$
 L(\tilde{p}_f) = \mathbb{E}_{\phi \sim \tilde{p}_f} [\log \tilde{p}_f(\phi) + S(\phi)]
 $$
 
-[cite_start]This loss allows training via self-sampling without requiring a pre-existing dataset[cite: 153].
+This loss allows training via self-sampling without requiring a pre-existing dataset[cite: 153].
 
 ### 2.2.3. Metropolis-Hastings Sampling
-To guarantee asymptotic exactness, the trained model is used as a proposal distribution in a Metropolis-Hastings chain. [cite_start]A proposed configuration $\phi' = f^{-1}(z)$ (where $z \sim \mathcal{N}(0, I)$) is accepted with probability[cite: 68]:
+To guarantee asymptotic exactness, the trained model is used as a proposal distribution in a Metropolis-Hastings chain. A proposed configuration $\phi' = f^{-1}(z)$ (where $z \sim \mathcal{N}(0, I)$) is accepted with probability[cite: 68]:
 
 $$
 A(\phi \to \phi') = \min\left(1, \frac{e^{-S(\phi')} \tilde{p}_f(\phi)}{e^{-S(\phi)} \tilde{p}_f(\phi')} \right)
 $$
+
+
+### local metroplis
+![Effective Mass](local_200000.png)
+
