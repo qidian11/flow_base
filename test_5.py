@@ -9,15 +9,97 @@ CONFIG = {
     'm2': -4.0,
     'lam': 5.113,
     'delta': 0.5,  # Metropolis step size
-    'save_steps': 1000,
-    'thermal_steps': 100000,
-    'n_samples': 1000000000,
+    'save_steps': 10,
+    'thermal_steps': 10000,
+    'n_samples': 100000,
     'bin_size': 100,
     'bootstrap_time': 1000
 }
 
 # 确保使用双精度
-DTYPE = torch.float64
+DTYPE = torch.float32
+
+
+def checkerboard_metropolis_optimized(phi):
+    """
+    优化的红黑策略：利用切片避免无效计算
+    """
+    L = CONFIG['L']
+    m2 = CONFIG['m2']
+    lam = CONFIG['lam']
+    delta = CONFIG['delta']
+    term1 = (4 + m2)
+
+    # 定义两个阶段的切片
+    # 0::2 表示从0开始每隔2取一个 (偶数)
+    # 1::2 表示从1开始每隔2取一个 (奇数)
+    # Checkerboard patterns:
+    # Set A (Red): (Even, Even) & (Odd, Odd)
+    # Set B (Black): (Even, Odd) & (Odd, Even)
+
+    # 为了简化，我们定义一个内部更新函数
+    def update_subgrid(phi_val, neighbor_sum_val):
+        # 仅对传入的子网格生成随机数
+        change = (torch.rand_like(phi_val, dtype=DTYPE) - 0.5) * 2 * delta
+        phi_new = phi_val + change
+
+        S_old = term1 * phi_val ** 2 + lam * phi_val ** 4 - phi_val * neighbor_sum_val
+        S_new = term1 * phi_new ** 2 + lam * phi_new ** 4 - phi_new * neighbor_sum_val
+
+        d_S = S_new - S_old
+        accept_prob = torch.rand_like(phi_val, dtype=DTYPE)
+        mask = (d_S < 0) | (torch.exp(-d_S) > accept_prob)
+
+        return torch.where(mask, phi_new, phi_val), mask.sum().item()
+
+    total_accepted = 0
+    total_sites = L * L
+
+    # === Phase 1: Update Red Sites ===
+    # 红点由两部分组成：(偶行,偶列) 和 (奇行,奇列)
+    # 它们的邻居都在 Black 集合中，此时是固定的
+
+    # 1.1 Update (Even, Even) - 邻居是 (E,O), (E,O), (O,E), (O,E) -> 都在 Black
+    # 我们需要手动从整个 phi 中提取邻居
+    # 为了避免复杂的切片索引，最简单的方法其实是先计算整个邻居和，再切片
+
+    # 注意：为了极致优化，这里通常不使用 roll，而是直接用切片加和
+    # 但为了代码可读性，我们还是计算一次全图邻居（或者只在需要的地方计算）
+
+    # 简单优化版：还是计算全图邻居，但只对红点做 Metropolis 计算
+    # 这样避免了 exp 计算的一半浪费
+
+    neigh = torch.roll(phi, 1, 0) + torch.roll(phi, -1, 0) + \
+            torch.roll(phi, 1, 1) + torch.roll(phi, -1, 1)
+
+    # 创建红点掩码（这部分其实可以预计算放在外部）
+    coords = torch.arange(L, device=phi.device)
+    i, j = torch.meshgrid(coords, coords, indexing='ij')
+    mask_red = (i + j) % 2 == 0
+    mask_black = (i + j) % 2 == 1
+
+    # 只提取红点的值和对应的邻居和
+    phi_red = phi[mask_red]
+    neigh_red = neigh[mask_red]
+
+    # 更新红点
+    phi_red_new, acc = update_subgrid(phi_red, neigh_red)
+    phi[mask_red] = phi_red_new  # 写回
+    total_accepted += acc
+
+    # === Phase 2: Update Black Sites ===
+    # 此时红点已经更新，必须重新计算邻居和
+    neigh = torch.roll(phi, 1, 0) + torch.roll(phi, -1, 0) + \
+            torch.roll(phi, 1, 1) + torch.roll(phi, -1, 1)
+
+    phi_black = phi[mask_black]
+    neigh_black = neigh[mask_black]
+
+    phi_black_new, acc = update_subgrid(phi_black, neigh_black)
+    phi[mask_black] = phi_black_new  # 写回
+    total_accepted += acc
+
+    return phi, total_accepted, total_sites
 
 
 def checkerboard_metropolis_sweep(phi):
@@ -170,7 +252,7 @@ def get_expected_phi(binning_ensemble):
     # 维度修正: 保持逻辑，对整个格子求平均
     # 先对 Space/Time 求平均 -> [Samples]
     # 注意：如果此处要减去每个样本的平均值，则保留 [Samples] 维度
-    return binning_ensemble.mean(dim=(0,1,2,3))
+    return binning_ensemble.mean(dim=(0, 1, 2, 3))
 
 
 def get_effective_mass(G_t):
@@ -244,7 +326,7 @@ def main():
     step = 0
     while step < CONFIG['thermal_steps']:
         # Changed to checkerboard_metropolis_sweep
-        phi, accepted, total = checkerboard_metropolis_sweep(phi)
+        phi, accepted, total = checkerboard_metropolis_optimized(phi)
         step += 1
         if step % 100 == 0:
             print(f"Thermal Step {step}/{CONFIG['thermal_steps']} (Acc: {accepted / total:.2f})")
@@ -252,13 +334,16 @@ def main():
     # 采样 (Sampling)
     print("Start Sampling...")
     ensemble = []
+    # <phi^2>
+    observable = []
     step = 0
     total_acc = 0
     total_count = 0
 
     while step < CONFIG['n_samples']:
         # Changed to checkerboard_metropolis_sweep
-        phi, accepted, total = checkerboard_metropolis_sweep(phi)
+        phi, accepted, total = checkerboard_metropolis_optimized(phi)
+        observable.append((phi ** 2).mean().item())
         total_acc += accepted
         total_count += total
 
@@ -272,6 +357,19 @@ def main():
             total_acc = 0
             total_count = 0
 
+    #计算关联长度
+    O = np.array(observable)
+    O = O - O.mean()
+    N = len(O)
+    C = np.correlate(O, O, mode='full')
+    C = C[N - 1:]  # 只要 t ≥ 0
+    C = C / C[0]  # 归一化 → ρ(t)
+    tau_int = 0.5
+    for t in range(1, len(C)):
+        if C[t] <= 0:
+            break
+        tau_int += C[t]
+    print("tau_int =", tau_int)
     # 处理数据
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
