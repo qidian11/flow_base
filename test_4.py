@@ -269,12 +269,17 @@ def main():
     # 处理数据
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
+    delta_inverse_hamiltonian_tensor = torch.tensor(delta_inverse_hamiltonian_list)
     delta_H_tensor = torch.stack(delta_H_list, dim=0)
     delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
     delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
     print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
-    print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
+    delta_H_std = torch.std(delta_H_tensor).item()
+    delta_H_error = delta_H_std / torch.sqrt(torch.tensor(delta_H_tensor.numel(), device=delta_H_tensor.device))
+    print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
+    print(f'delta_H_error:{delta_H_error:.2e}')
+    print(f'exp delta_H expected:{torch.mean(torch.exp(delta_H_tensor)).item():.2e}')
     # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
     # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
     y = np.array([x.item() for x in delta_inverse_hamiltonian_list])
