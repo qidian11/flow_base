@@ -279,7 +279,11 @@ def main():
     delta_H_error = delta_H_std / torch.sqrt(torch.tensor(delta_H_tensor.numel(), device=delta_H_tensor.device))
     print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
     print(f'delta_H_error:{delta_H_error:.2e}')
-    print(f'exp delta_H expected:{torch.mean(torch.exp(delta_H_tensor)).item():.2e}')
+    delta_H_exp_tensor = torch.exp(delta_H_tensor)
+    delta_H_exp_std = torch.std(delta_H_exp_tensor).item()
+    delta_H_exp_error = delta_H_exp_std / torch.sqrt(torch.tensor(delta_H_exp_tensor.numel(), device=delta_H_exp_tensor.device))
+    print(f'expect of delta_H_exp:{torch.mean(delta_H_exp_tensor).item():.2e}')
+    print(f'delta_H_exp_error:{delta_H_exp_error:.2e}')
     # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
     # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
     y = np.array([x.item() for x in delta_inverse_hamiltonian_list])
