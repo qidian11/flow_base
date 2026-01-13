@@ -31,8 +31,8 @@ CONFIG = {
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 100000,
-    'bin_size': 100,
+    'n_samples': 1000000,
+    'bin_size': 10,
     'bootstrap_time': 1000,
 
 }
@@ -223,9 +223,14 @@ def binning(data):
     return data
 
 
-def bootstrap(data):
+def bootstrap(data,bootsrtrap_time):
     N_bin = data.shape[0]
     lst = []
+    for _ in range(bootsrtrap_time):
+        idx = torch.randint(0, N_bin, (N_bin,))
+        lst.append(data[idx].mean())
+    return torch.stack(lst)
+
     for i in range(N_bin):
         idx = torch.randint(0, data.size(0), (1,))
         lst.append(data[idx.item()])
@@ -290,11 +295,28 @@ def main():
     # 处理数据
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
+    print(f"Ensemble shape: {ensemble_tensor.shape}")
+
+    delta_inverse_hamiltonian_tensor = torch.tensor(delta_inverse_hamiltonian_list)
     delta_H_tensor = torch.stack(delta_H_list, dim=0)
     delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
     delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
-    print(f"Ensemble shape: {ensemble_tensor.shape}")
-    print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
+
+
+    binning_delta_H_tensor = binning(delta_H_tensor)
+    # mean in bin
+    binning_delta_H_tensor = binning_delta_H_tensor.mean(dim=1)
+    bootstrap_delta_H_tensor = bootstrap(binning_delta_H_tensor, CONFIG['bootstrap_time'])
+    delta_H_error = bootstrap_delta_H_tensor.std(dim=0)
+    print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
+    print(f"{torch.mean(binning_delta_H_tensor):.5f}({int(delta_H_error * 1e5):02d})")
+    delta_H_exp_tensor = torch.exp(delta_H_tensor)
+    delta_H_exp_std = torch.std(delta_H_exp_tensor).item()
+    delta_H_exp_error = delta_H_exp_std / torch.sqrt(torch.tensor(delta_H_exp_tensor.numel(), device=delta_H_exp_tensor.device))
+    print(f'expect of delta_H_exp:{torch.mean(delta_H_exp_tensor).item():.2e}')
+    print(f'delta_H_exp_error:{delta_H_exp_error:.2e}')
+
+    # print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
     # print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
     # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
     # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
@@ -346,13 +368,15 @@ def main():
         G_t_inside_bin = calculate_G_t_list_inside_bin(binning_ensemble)
         print(f"G_t_inside_bin's shape:{G_t_inside_bin.shape}")
         # shape=(bootsraptime, N_bin, time)
-        bootstrap_tensor = []
-        for i in range(CONFIG['bootstrap_time']):
-            bootstrap_tensor.append(bootstrap(G_t_inside_bin))
 
+        # for i in range(CONFIG['bootstrap_time']):
+        #     bootstrap_tensor.append(bootstrap(G_t_inside_bin))
+        # shape=(bootsraptime, time)
+
+        bootstrap_tensor = bootstrap(binning_ensemble, CONFIG['bootstrap_time'])
         # green function
         # shape=(bootsraptime, time)
-        bootstrap_tensor = torch.stack(bootstrap_tensor).mean(dim=1)
+        # bootstrap_tensor = torch.stack(bootstrap_tensor).mean(dim=1)
         print(f"bootstrap_tensor's shape:{bootstrap_tensor.shape}")
         G_error_bar = bootstrap_tensor.std(dim=0)
         y_err_g = G_error_bar.numpy()
