@@ -3,6 +3,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
+
+def get_device(prefer="auto"):
+    if prefer == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+
+    if prefer == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+
+    if prefer == "auto":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return torch.device("xpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+
+    return torch.device("cpu")
+
+
+device = get_device(prefer="xpu")
+
 # --- 配置 ---
 CONFIG = {
     'L': 14,
@@ -14,11 +33,13 @@ CONFIG = {
     'thermal_steps': 1000,
     'n_samples': 100000,
     'bin_size': 100,
-    'bootstrap_time': 1000
+    'bootstrap_time': 1000,
+
 }
 
 
 DTYPE = torch.float64
+
 
 
 def calculate_action(phi):
@@ -99,7 +120,7 @@ def HMC_step_single_chain(phi, tao):
     输入 phi shape: [L, L]
     """
     # 1. get new p, shape = [L, L]
-    p = torch.randn(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
+    p = torch.randn(CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=phi.device)
 
     hamiltonian_old = calculate_hamiltonian(phi, p)
 
@@ -217,7 +238,7 @@ def main():
     print(f"Config: L={CONFIG['L']}, Tao={CONFIG['tao']} (No Batch/Channel dims)")
 
     # 初始化：直接生成 [L, L]
-    phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
+    phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
     delta_H_list = []
     delta_inverse_hamiltonian_list = []
     delta_phi_list = []
@@ -231,7 +252,7 @@ def main():
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
             if step == 0:
-                phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE)
+                phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
             continue
 
         step += 1
@@ -260,7 +281,7 @@ def main():
 
         if step % CONFIG['save_steps'] == 0:
             # detach 并存入列表
-            ensemble.append(phi.clone().detach())
+            ensemble.append(phi.clone().detach().cpu())
 
         step += 1
         if step % 100 == 0:
@@ -269,21 +290,12 @@ def main():
     # 处理数据
     # ensemble_tensor shape: [Samples, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
-    delta_inverse_hamiltonian_tensor = torch.tensor(delta_inverse_hamiltonian_list)
     delta_H_tensor = torch.stack(delta_H_list, dim=0)
     delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
     delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
     print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
-    delta_H_std = torch.std(delta_H_tensor).item()
-    delta_H_error = delta_H_std / torch.sqrt(torch.tensor(delta_H_tensor.numel(), device=delta_H_tensor.device))
-    print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
-    print(f'delta_H_error:{delta_H_error:.2e}')
-    delta_H_exp_tensor = torch.exp(delta_H_tensor)
-    delta_H_exp_std = torch.std(delta_H_exp_tensor).item()
-    delta_H_exp_error = delta_H_exp_std / torch.sqrt(torch.tensor(delta_H_exp_tensor.numel(), device=delta_H_exp_tensor.device))
-    print(f'expect of delta_H_exp:{torch.mean(delta_H_exp_tensor).item():.2e}')
-    print(f'delta_H_exp_error:{delta_H_exp_error:.2e}')
+    # print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
     # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
     # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
     y = np.array([x.item() for x in delta_inverse_hamiltonian_list])
