@@ -125,3 +125,32 @@ $$
 ### local metroplis
 ![Effective Mass](local_200000.png)
 
+data.shape:torch.Size([120000])
+expect of delta_H:2.93e-01
+0.29299(68)
+data.shape:torch.Size([10])
+expect of delta_H_exp:9.99e-01
+9.99e-01(71)
+delta_H_exp_error:7.19e-04
+data.shape:torch.Size([12000, 14, 14])
+bootstrap_phi_to_1 shape: torch.Size([1000])
+phi_to_1_error shape: torch.Size([])
+data.shape:torch.Size([12000, 14, 14])
+data.shape:torch.Size([12000, 14, 14])
+data.shape:torch.Size([12000, 14, 14])
+data.shape:torch.Size([12000, 14, 14])
+delta_H: 2.93e-01
+expectation of exp delta_h: 9.99e-01
+phi_to_1:4.92e-04
+0.000492(0.000920)
+phi_to_2:2.18e-01
+0.218467(0.000063)
+phi_to_3:2.37e-04
+0.000237(0.000361)
+phi_to_4:9.07e-02
+0.090712(0.000044)
+phi_to_5:1.52e-04
+0.000152(0.000185)
+G_t_inside_bin's shape:torch.Size([12000, 14])
+data.shape:torch.Size([12000, 14])
+bootstrap_tensor's shape:torch.Size([1000, 14])

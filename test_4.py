@@ -31,7 +31,7 @@ CONFIG = {
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 1000000,
+    'n_samples': 1200000,
     'bin_size': 10,
     'bootstrap_time': 1000,
 
@@ -224,11 +224,12 @@ def binning(data):
 
 
 def bootstrap(data,bootsrtrap_time):
+    print(f"data.shape:{data.shape}")
     N_bin = data.shape[0]
     lst = []
     for _ in range(bootsrtrap_time):
         idx = torch.randint(0, N_bin, (N_bin,))
-        lst.append(data[idx].mean())
+        lst.append(data[idx].mean(dim=0))
     return torch.stack(lst)
 
     for i in range(N_bin):
@@ -261,7 +262,7 @@ def main():
             continue
 
         step += 1
-        if step % 100 == 0:
+        if step % 1000 == 0:
             print(f"Thermal Step {step}/{CONFIG['thermal_steps']}")
 
     # 采样 (Sampling)
@@ -289,7 +290,7 @@ def main():
             ensemble.append(phi.clone().detach().cpu())
 
         step += 1
-        if step % 100 == 0:
+        if step % 1000 == 0:
             print(f"Sampling Step {step}/{CONFIG['n_samples']}, Accept Ratio: {accept_count / step * 100:.2f}%")
 
     # 处理数据
@@ -310,10 +311,14 @@ def main():
     delta_H_error = bootstrap_delta_H_tensor.std(dim=0)
     print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
     print(f"{torch.mean(binning_delta_H_tensor):.5f}({int(delta_H_error * 1e5):02d})")
-    delta_H_exp_tensor = torch.exp(delta_H_tensor)
-    delta_H_exp_std = torch.std(delta_H_exp_tensor).item()
-    delta_H_exp_error = delta_H_exp_std / torch.sqrt(torch.tensor(delta_H_exp_tensor.numel(), device=delta_H_exp_tensor.device))
-    print(f'expect of delta_H_exp:{torch.mean(delta_H_exp_tensor).item():.2e}')
+    delta_H_exp_tensor = torch.exp(-delta_H_tensor)
+    binning_delta_H_exp_tensor = binning(delta_H_exp_tensor)
+    binning_delta_H_exp_tensor = binning_delta_H_exp_tensor.mean(dim=0)
+    bootstrap_delta_H_exp_tensor = bootstrap(binning_delta_H_exp_tensor, CONFIG['bootstrap_time'])
+    delta_H_exp_error = bootstrap_delta_H_exp_tensor.std(dim=0)
+
+    print(f'expect of delta_H_exp:{torch.mean(binning_delta_H_exp_tensor).item():.2e}')
+    print(f'{torch.mean(binning_delta_H_exp_tensor):.2e}({int(delta_H_exp_error * 1e5):02d})')
     print(f'delta_H_exp_error:{delta_H_exp_error:.2e}')
 
     # print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
@@ -352,17 +357,34 @@ def main():
     # shape=(N_bin, bin_size, time, space)
     binning_ensemble = binning(ensemble_tensor)
     phi_to_1 = binning_ensemble.mean()
+    bootstrap_phi_to_1 = bootstrap(binning_ensemble.mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1,2))
+    print(f"bootstrap_phi_to_1 shape: {bootstrap_phi_to_1.shape}")
+    phi_to_1_error = bootstrap_phi_to_1.std(dim=0)
+    print(f"phi_to_1_error shape: {phi_to_1_error.shape}")
     phi_to_2 = (binning_ensemble * binning_ensemble).mean()
+    bootstrap_phi_to_2 = bootstrap((binning_ensemble**2).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1,2))
+    phi_to_2_error = bootstrap_phi_to_2.std(dim=0)
     phi_to_3 = (binning_ensemble **3).mean()
+    bootstrap_phi_to_3 = bootstrap((binning_ensemble**3).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1,2))
+    phi_to_3_error = bootstrap_phi_to_3.std(dim=0)
     phi_to_4 = (binning_ensemble ** 4).mean()
+    bootstrap_phi_to_4 = bootstrap((binning_ensemble**4).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1,2))
+    phi_to_4_error = bootstrap_phi_to_4.std(dim=0)
     phi_to_5 = (binning_ensemble ** 5).mean()
+    bootstrap_phi_to_5 = bootstrap((binning_ensemble**5).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1,2))
+    phi_to_5_error = bootstrap_phi_to_5.std(dim=0)
     print("delta_H: {:.2e}".format(delta_H_tensor.mean().item()))
     print("expectation of exp delta_h: {:.2e}".format(torch.exp(-delta_H_tensor).mean().item()))
     print(f"phi_to_1:{phi_to_1:.2e}")
+    print(f"{phi_to_1:.6f}({phi_to_1_error:.6f})")
     print(f"phi_to_2:{phi_to_2:.2e}")
+    print(f"{phi_to_2:.6f}({phi_to_2_error:.6f})")
     print(f"phi_to_3:{phi_to_3:.2e}")
+    print(f"{phi_to_3:.6f}({phi_to_3_error:.6f})")
     print(f"phi_to_4:{phi_to_4:.2e}")
+    print(f"{phi_to_4:.6f}({phi_to_4_error:.6f})")
     print(f"phi_to_5:{phi_to_5:.2e}")
+    print(f"{phi_to_5:.6f}({phi_to_5_error:.6f})")
     try:
         # shape: N_bin, t
         G_t_inside_bin = calculate_G_t_list_inside_bin(binning_ensemble)
@@ -373,12 +395,12 @@ def main():
         #     bootstrap_tensor.append(bootstrap(G_t_inside_bin))
         # shape=(bootsraptime, time)
 
-        bootstrap_tensor = bootstrap(binning_ensemble, CONFIG['bootstrap_time'])
+        bootstrap_ensemble_tensor = bootstrap(G_t_inside_bin, CONFIG['bootstrap_time'])
         # green function
         # shape=(bootsraptime, time)
         # bootstrap_tensor = torch.stack(bootstrap_tensor).mean(dim=1)
-        print(f"bootstrap_tensor's shape:{bootstrap_tensor.shape}")
-        G_error_bar = bootstrap_tensor.std(dim=0)
+        print(f"bootstrap_tensor's shape:{bootstrap_ensemble_tensor.shape}")
+        G_error_bar = bootstrap_ensemble_tensor.std(dim=0)
         y_err_g = G_error_bar.numpy()
         G_t = G_t_inside_bin.mean(dim=0)
 
@@ -386,7 +408,7 @@ def main():
         # shape=(time)
         effective_mass = get_effective_mass(G_t)
         effective_mass = effective_mass[1:-1]
-        bootstrap_effective_mass = get_effective_mass(bootstrap_tensor)
+        bootstrap_effective_mass = get_effective_mass(bootstrap_ensemble_tensor)
         bootstrap_effective_mass = bootstrap_effective_mass[:, 1:-1]
         e_m_error_bar = bootstrap_effective_mass.std(dim=0)
         y_err_m = e_m_error_bar.numpy()
