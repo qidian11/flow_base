@@ -20,7 +20,8 @@ def get_device(prefer="auto"):
     return torch.device("cpu")
 
 
-device = get_device(prefer="xpu")
+device = get_device(prefer="cpu")
+print(f"🔥 当前测试设备: {device}")
 
 # --- 配置 ---
 CONFIG = {
@@ -31,37 +32,37 @@ CONFIG = {
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 1000,
-    'n_samples': 1200000,
-    'bin_size': 10,
-    'bootstrap_time': 1000,
-
+    'n_samples': 120000,
+    'bin_size': 100,
+    'bootstrap_time': 2000,
+    'batch_size': 128,
 }
 
 
-DTYPE = torch.float64
+DTYPE = torch.float32
 
 
 
 def calculate_action(phi):
-    # phi shape: [L, L]
+    # phi shape: [batchsize, L, L]
     # 这里的维度变成了 0 和 1
-    phi_up = torch.roll(phi, shifts=-1, dims=0)
-    phi_down = torch.roll(phi, shifts=1, dims=0)
-    phi_right = torch.roll(phi, shifts=1, dims=1)
-    phi_left = torch.roll(phi, shifts=-1, dims=1)
+    phi_up = torch.roll(phi, shifts=-1, dims=1)
+    phi_down = torch.roll(phi, shifts=1, dims=1)
+    phi_right = torch.roll(phi, shifts=1, dims=2)
+    phi_left = torch.roll(phi, shifts=-1, dims=2)
 
     # 动能项 (离散拉普拉斯算子部分)
     kinetic_term = 4 * phi * phi - phi * (phi_right + phi_left + phi_up + phi_down)
     potential_term = CONFIG['m2'] * phi * phi + CONFIG['lam'] * phi ** 4
 
     # 对整个 grid 求和，得到标量 Action
-    action = (kinetic_term + potential_term).sum()
+    action = (kinetic_term + potential_term).sum(dim=(1,2))
     return action
 
 
 def calculate_kinetic_energy(p):
     # p shape: [L, L]
-    return 0.5 * torch.sum(p ** 2)
+    return 0.5 * torch.sum(p ** 2, dim=(1,2))
 
 
 def calculate_hamiltonian(phi, p):
@@ -72,10 +73,10 @@ def calculate_hamiltonian(phi, p):
 
 def get_force(phi):
     # phi shape: [L, L]
-    phi_up = torch.roll(phi, shifts=-1, dims=0)
-    phi_down = torch.roll(phi, shifts=1, dims=0)
-    phi_right = torch.roll(phi, shifts=1, dims=1)
-    phi_left = torch.roll(phi, shifts=-1, dims=1)
+    phi_up = torch.roll(phi, shifts=-1, dims=1)
+    phi_down = torch.roll(phi, shifts=1, dims=1)
+    phi_right = torch.roll(phi, shifts=1, dims=2)
+    phi_left = torch.roll(phi, shifts=-1, dims=2)
 
     # 导数计算
     return -(8 * phi - 2 * (phi_up + phi_down + phi_right + phi_left)
@@ -115,45 +116,44 @@ def leap_frog(phi, p, tao):
     return phi_new, p_new
 
 
-def HMC_step_single_chain(phi, tao):
-    """
-    输入 phi shape: [L, L]
-    """
-    # 1. get new p, shape = [L, L]
-    p = torch.randn(CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=phi.device)
+def HMC_step(phi, tao):
+    # 1. 为每条链独立生成动量
+    p = torch.randn_like(phi)
+    h_old = calculate_hamiltonian(phi, p)
 
-    hamiltonian_old = calculate_hamiltonian(phi, p)
-
-    # 2. Leapfrog
+    # 2. Leapfrog 演化
     phi_new, p_new = leap_frog(phi, p, tao)
 
-    # 3. inverse leapfrog
-    phi_inverse, p_inverse = leap_frog(phi_new, -p_new, tao)
-    delta_phi = phi - phi_inverse
-    delta_p = p + p_inverse
-    hamiltonian_inverse = calculate_hamiltonian(phi_inverse, p_inverse)
+    # 3. 计算反向演化（用于可逆性检查 delta_phi, delta_p）
+    phi_inv, p_inv = leap_frog(phi_new, -p_new, tao)
+    delta_phi = phi - phi_inv  # [Batch, L, L]
+    delta_p = p + p_inv        # [Batch, L, L]
 
-    delta_inverse_H = hamiltonian_inverse - hamiltonian_old
-    # --- NaN check ---
-    if torch.isnan(phi_new).any() or torch.isinf(phi_new).any():
-        return phi, delta_inverse_H, delta_phi, delta_p, False, False
+    h_inv = calculate_hamiltonian(phi_inv, p_inv)
+    delta_inverse_H = h_inv - h_old # [Batch]
 
-    hamiltonian_new = calculate_hamiltonian(phi_new, p_new)
+    # 4. 判定接受
+    h_new = calculate_hamiltonian(phi_new, p_new)
+    delta_H = h_new - h_old # [Batch]
 
-    # calculate delta H
-    delta_H = hamiltonian_new - hamiltonian_old
+    # --- NaN/Inf 检查 ---
+    # 如果某条链数值爆炸，我们标记 success 为 False
+    success = ~torch.isnan(delta_H).any() and ~torch.isinf(delta_H).any()
+    if not success:
+        return phi, delta_H, delta_inverse_H, delta_phi, delta_p, False, 0.0
 
-    if torch.isnan(delta_H) or torch.isinf(delta_H):
-        return phi, delta_H, delta_inverse_H, delta_phi, delta_p, False, False
+    # 5. Metropolis 接受/拒绝 (Per-chain)
+    prob = torch.exp(-delta_H.clamp(max=50)) # 防止溢出
+    rand_num = torch.rand_like(prob)
+    accepted_mask = rand_num < prob # [Batch] 的布尔掩码
 
-    # 3. Metropolis 接受/拒绝
-    prob = torch.exp(-delta_H).item()
-    rand_num = torch.rand(1).item()
+    # 更新 phi：接受的用 phi_new，拒绝的保留原 phi
+    phi_next = torch.where(accepted_mask.view(-1, 1, 1), phi_new, phi)
 
-    if rand_num < prob:
-        return phi_new, delta_H, delta_inverse_H, delta_phi, delta_p, True, True
-    else:
-        return phi, delta_H, delta_inverse_H, delta_phi, delta_p, True, False
+    # 6. 计算平均接受率
+    avg_accept = accepted_mask.float().mean().item()
+
+    return phi_next, delta_H, delta_inverse_H, delta_phi, delta_p, True, avg_accept
 
 
 def calculate_G_t_list_inside_bin(binning_ensemble):
@@ -243,8 +243,8 @@ def bootstrap(data,bootsrtrap_time):
 def main():
     print(f"Config: L={CONFIG['L']}, Tao={CONFIG['tao']} (No Batch/Channel dims)")
 
-    # 初始化：直接生成 [L, L]
-    phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
+    # 初始化：直接生成 [batchsize, L, L]
+    phi = torch.zeros(CONFIG['batch_size'], CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
     delta_H_list = []
     delta_inverse_hamiltonian_list = []
     delta_phi_list = []
@@ -253,12 +253,12 @@ def main():
     print("Start Thermalization...")
     step = 0
     while step < CONFIG['thermal_steps']:
-        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, CONFIG['tao'])
 
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
             if step == 0:
-                phi = torch.zeros(CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
+                phi = torch.zeros(CONFIG['batch_size'], CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
             continue
 
         step += 1
@@ -272,38 +272,47 @@ def main():
     accept_count = 0
 
     while step < CONFIG['n_samples']:
-        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, accepted = HMC_step_single_chain(phi, CONFIG['tao'])
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, CONFIG['tao'])
 
         if not success:
             print(f"Sample Step {step}: NaN detected! Retrying...")
             continue
 
-        delta_H_list.append(delta_H)
-        delta_inverse_hamiltonian_list.append(inverse_hamiltonian)
-        delta_phi_list.append(delta_phi)
-        delta_p_list.append(delta_p)
-        if accepted:
-            accept_count += 1
+        accept_count += avg_acc  # 累加平均接受率
 
         if step % CONFIG['save_steps'] == 0:
             # detach 并存入列表
             ensemble.append(phi.clone().detach().cpu())
+            delta_H_list.append(delta_H.detach().cpu())
+            delta_inverse_hamiltonian_list.append(inverse_hamiltonian.detach().cpu())
+            delta_phi_list.append(delta_phi.detach().cpu())
+            delta_p_list.append(delta_p.detach().cpu())
+
 
         step += 1
         if step % 1000 == 0:
             print(f"Sampling Step {step}/{CONFIG['n_samples']}, Accept Ratio: {accept_count / step * 100:.2f}%")
 
     # 处理数据
-    # ensemble_tensor shape: [Samples, L, L]
+    # ensemble_tensor shape: [Samples, batchsize, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
+    L = CONFIG['L']
+    ensemble_tensor = ensemble_tensor.transpose(0, 1).reshape(-1, L, L)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
 
-    delta_inverse_hamiltonian_tensor = torch.tensor(delta_inverse_hamiltonian_list)
+    delta_inverse_hamiltonian_tensor = torch.stack(delta_inverse_hamiltonian_list)
+    delta_inverse_hamiltonian_tensor = delta_inverse_hamiltonian_tensor.transpose(0, 1).reshape(-1)
+
     delta_H_tensor = torch.stack(delta_H_list, dim=0)
+    delta_H_tensor = delta_H_tensor.transpose(0, 1).reshape(-1)
+
     delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
+    delta_phi_list_tensor = delta_phi_list_tensor.transpose(0, 1).reshape(-1, L, L)
+
     delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
+    delta_p_list_tensor = delta_p_list_tensor.transpose(0, 1).reshape(-1, L, L)
 
-
+    # shape:[N_bin, bin_size]
     binning_delta_H_tensor = binning(delta_H_tensor)
     # mean in bin
     binning_delta_H_tensor = binning_delta_H_tensor.mean(dim=1)
@@ -325,7 +334,7 @@ def main():
     # print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
     # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
     # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
-    y = np.array([x.item() for x in delta_inverse_hamiltonian_list])
+    y = np.array([x.item() for x in delta_inverse_hamiltonian_tensor.cpu().numpy()])
     x = torch.arange(len(y))
 
     plt.figure()
@@ -403,6 +412,8 @@ def main():
         G_error_bar = bootstrap_ensemble_tensor.std(dim=0)
         y_err_g = G_error_bar.numpy()
         G_t = G_t_inside_bin.mean(dim=0)
+        print(f"G_t:{G_t.item():.16E}")
+        print(f"y_err_g:{y_err_g.item():.16E}")
 
         # effective mass
         # shape=(time)

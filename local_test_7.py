@@ -11,9 +11,10 @@ CONFIG = {
     'delta': 0.5,
     'save_steps': 10,
     'thermal_steps': 5000,
-    'n_samples': 2000000,
+    'n_samples': 20000,
     'bin_size': 100,
-    'bootstrap_time': 1000
+    'bootstrap_time': 1000,
+    'batch_size': 128,
 }
 
 
