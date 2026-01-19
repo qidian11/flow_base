@@ -13,7 +13,7 @@ class FunctionNode:
     def __init__(self, ctx, function_cls, inputs):
         self.ctx = ctx
         self.function_cls = function_cls
-        self.variable_cls = None
+        self.output_variable = None
         self.inputs = inputs
         self.generation = max([x.generation for x in self.inputs if isinstance(x, Variable)]+[-1]) +1
 
@@ -37,10 +37,11 @@ class Function:
 
 class Variable:
     def __init__(self, data, function_node=None):
-        self.data = data
+        # 默认使用numpy格式的数据
+        self.data = np.array(data) if not isinstance(data, np.ndarray) else data
         self.function_node = function_node
         if function_node is not None:
-            function_node.variable_cls = self
+            function_node.output_variable = self
         self.store_history = False
         self.grad_history = []
         self.grad = None
@@ -68,6 +69,23 @@ class Variable:
         # 当执行 2.0 * self 时被触发
         return self.__mul__(other)
 
+    # 在 Variable 类中添加快捷方式
+    def relu(self):
+        return ReLU.apply(self)
+
+    def sum(self):
+        # 这里的 self 就是调用 sum 的那个 Variable 对象
+        return Sum.apply(self)
+
+    def mean(self):
+        return Mean.apply(self)
+
+    def log(self):
+        return Log.apply(self)
+
+    def roll(self, shift, axis):
+        return Roll.apply(self, shift, axis)
+
 
     def enable_history(self):
         self.store_history = True
@@ -80,7 +98,7 @@ class Variable:
 
     def accumulate_grad(self, grad, tag="default"):
         if self.grad is None:
-            self.grad = grad
+            self.grad = np.array(grad, copy=True)
         else:
             self.grad += grad
 
@@ -94,9 +112,10 @@ class Variable:
         if grad_output is None:
             grad_output = np.ones_like(self.data)
 
+        self.accumulate_grad(grad_output, tag)
         if self.function_node is None:
             return
-        self.accumulate_grad(grad_output, tag)
+
 
         fuc_node_list = []
         seen_nodes_set = set()
@@ -112,7 +131,7 @@ class Variable:
             function_cls = current_fuc_node.function_cls
             ctx = current_fuc_node.ctx
             inputs = current_fuc_node.inputs
-            input_gradients = function_cls.backward(current_fuc_node.variable_cls.grad, ctx)
+            input_gradients = function_cls.backward(current_fuc_node.output_variable.grad, ctx)
 
             if not isinstance(input_gradients, tuple):
                 input_gradients = (input_gradients,)
@@ -139,11 +158,20 @@ class Mul(Function):
         grad_a = grad_output * b
         grad_b = grad_output * a
 
+        for i, (input_arr, grad_val) in enumerate([(a, grad_a), (b, grad_b)]):
+            res_grad = grad_val
+            if np.ndim(input_arr) < np.ndim(grad_output):
+                res_grad = np.sum(res_grad, axis=tuple(range(np.ndim(grad_output) - np.ndim(input_arr))))
 
-        if np.ndim(a) < np.ndim(grad_a):
-            grad_a = np.sum(grad_a)
-        if np.ndim(b) < np.ndim(grad_b):
-            grad_b = np.sum(grad_b)
+            # 处理形状相同但有维度为 1 的情况
+            if res_grad.shape != input_arr.shape:
+                axes = tuple(idx for idx, (d_in, d_g) in enumerate(zip(input_arr.shape, res_grad.shape)) if d_in < d_g)
+                res_grad = np.sum(res_grad, axis=axes, keepdims=True)
+
+            if i == 0:
+                grad_a = res_grad
+            else:
+                grad_b = res_grad
 
         return grad_a, grad_b
 
@@ -169,28 +197,126 @@ class Add(Function):
     @staticmethod
     def backward(grad_output, ctx):
         a, b = ctx.save_tensors
-        grad_a = grad_output
-        grad_b = grad_output
+        grad_a = grad_output.copy()
+        grad_b = grad_output.copy()
 
         # 处理广播逻辑：
         # 如果 a 的维度比 grad_output 小，说明 a 被广播了，需要求和还原
-        if np.ndim(a) < np.ndim(grad_output):
-            grad_a = np.sum(grad_a)
-        elif a.shape != grad_output.shape:
-            # 处理形状相同但某些维度为 1 的情况 (例如 (3, 3) + (3, 1))
-            # 找到那些长度为 1 的轴并求和，保持维度
-            axes = tuple(i for i, (d_a, d_g) in enumerate(zip(a.shape, grad_output.shape)) if d_a < d_g)
-            grad_a = np.sum(grad_a, axis=axes, keepdims=True)
+        for i, (input_arr, grad_val) in enumerate([(a, grad_a), (b, grad_b)]):
+            res_grad = grad_val
+            if np.ndim(input_arr) < np.ndim(grad_output):
+                res_grad = np.sum(res_grad, axis=tuple(range(np.ndim(grad_output) - np.ndim(input_arr))))
 
-        # 对 b 执行同样的逻辑
-        if np.ndim(b) < np.ndim(grad_output):
-            grad_b = np.sum(grad_b)
-        elif b.shape != grad_output.shape:
-            axes = tuple(i for i, (d_b, d_g) in enumerate(zip(b.shape, grad_output.shape)) if d_b < d_g)
-            grad_b = np.sum(grad_b, axis=axes, keepdims=True)
+            # 处理形状相同但有维度为 1 的情况
+            if res_grad.shape != input_arr.shape:
+                axes = tuple(idx for idx, (d_in, d_g) in enumerate(zip(input_arr.shape, res_grad.shape)) if d_in < d_g)
+                res_grad = np.sum(res_grad, axis=axes, keepdims=True)
+
+            if i == 0:
+                grad_a = res_grad
+            else:
+                grad_b = res_grad
 
         return grad_a, grad_b
 
+class Exp(Function):
+    @staticmethod
+    def forward(ctx, a):
+        ctx.save_for_backward(a)
+        return np.exp(a)
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, = ctx.save_tensors
+        grad = grad_output * np.exp(a)
+        return grad
+
+class Pow(Function):
+    @staticmethod
+    def forward(ctx, a, n):
+        ctx.save_for_backward(a, n)
+        return np.power(a, n)
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, n = ctx.save_tensors
+        grad = grad_output * n * np.power(a, n-1)
+        return grad, None
+
+class Roll(Function):
+    @staticmethod
+    def forward(ctx, a, shift, axis):
+        ctx.save_for_backward(a, shift, axis)
+        return np.roll(a, shift, axis)
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, shift, axis = ctx.save_tensors
+        grad = np.roll(grad_output, -shift, axis)
+        return grad, None, None
+
+class Log(Function):
+    @staticmethod
+    def forward(ctx, a):
+        # 增加一个极小值 epsilon 防止 log(0)
+        eps = 1e-12
+        a_clipped = np.clip(a, eps, np.inf)
+        ctx.save_for_backward(a_clipped)
+        return np.log(a_clipped)
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, = ctx.save_tensors
+        grad = grad_output * 1.0 / a
+        return grad
+
+class AddN(Function):
+    @staticmethod
+    def forward(ctx, *inputs):
+        ctx.save_for_backward(*inputs)  # 展开存储！
+        res = np.sum(inputs, axis=0)  # 更简洁的写法
+        return res
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        inputs = ctx.save_tensors
+        grads = []
+        for input in inputs:
+            grad = grad_output.copy()
+            if np.ndim(input) < np.ndim(grad_output):
+                # 比如 input 是 (3,), grad 是 (2, 3)，要把第 0 维缩减掉
+                diff = np.ndim(grad) - np.ndim(input)
+                grad = np.sum(grad, axis=tuple(range(diff)))
+            # 处理维度数一致但某维度长度为 1 的情况 (如 (1, 3) vs (5, 3))
+            if grad.shape != input.shape:
+                axes = []
+                for i, (d_in, d_g) in enumerate(zip(input.shape, grad.shape)):
+                    if d_in < d_g:
+                        axes.append(i)
+                if axes:
+                    grad = np.sum(grad, axis=tuple(axes), keepdims=True)
+
+            grads.append(grad)
+        return grads
+
+class Sum(Function):
+    @staticmethod
+    def forward(ctx, a):
+        ctx.save_for_backward(a.shape) # 存形状更省内存
+        return np.sum(a)
+    @staticmethod
+    def backward(grad_output, ctx):
+        a_shape, = ctx.save_tensors
+        return np.broadcast_to(grad_output, a_shape)
+
+class Mean(Function):
+    @staticmethod
+    def forward(ctx, a):
+        ctx.save_for_backward(a.shape)
+        return np.mean(a)
+    @staticmethod
+    def backward(grad_output, ctx):
+        a_shape, = ctx.save_tensors
+        numel = np.prod(a_shape)
+        return np.broadcast_to(grad_output/numel, a_shape)
 # test
 # x = Variable(2.0)
 # y = Variable(3.0)
@@ -228,9 +354,19 @@ class ReLU(Function):
         grad_x[x <= 0] = 0
         return grad_x
 
-# 在 Variable 类中添加快捷方式
-def relu(x):
-    return ReLU.apply(x)
+class LeakyReLU(Function):
+    @staticmethod
+    def forward(ctx, x):
+        alpha = 0.1
+        ctx.save_for_backward(x,alpha)
+        return np.where(x > 0, x, alpha * x)
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        x,alpha = ctx.save_tensors
+        x_grad = np.ones_like(x)
+        x_grad[x <= 0] = alpha
+        return grad_output * x_grad
 
 class Linear:
     def __init__(self, in_features, out_features):
@@ -239,15 +375,25 @@ class Linear:
         self.b = Variable(np.zeros(out_features))
 
     def forward(self, x):
-        # 使用你重载过的 @ 和 + 运算符
         return x @ self.W + self.b
 
     def parameters(self):
         return [self.W, self.b]
 
 class NN:
-    def setLayers(self, *layers):
+    def __init__(self, layers):
         self.layers = layers
+        self.parameters = []
+        self.set_all_parameters()
+
+    def set_all_parameters(self):
+        for layer in self.layers:
+            if isinstance(layer, Linear):
+                self.parameters += layer.parameters()
+
+    def clear_gradient(self):
+        for parameter in self.parameters:
+            parameter.clear_grad()
 
     def forward(self, x):
         data = x
@@ -256,12 +402,39 @@ class NN:
         return data
 
     def backward(self, loss, optimizer):
+        self.clear_gradient()
         loss.backward()
         optimizer.optimize(self.layers)
 
 
 class Optimizer:
-    pass
+    def optimize(self):
+        raise NotImplementedError
+
+class Adam(Optimizer):
+    def __init__(self, parameters, lr=0.001, epsilon=1e-8, beta1=0.9, beta2=0.999):
+        self.parameters = parameters
+        self.lr = lr
+        self.epsilon = epsilon
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.m_dict = {id(p): np.zeros_like(p.data) for p in self.parameters}
+        self.v_dict = {id(p): np.zeros_like(p.data) for p in self.parameters}
+        self.optimize_step = 0
+
+    def optimize(self):
+        self.optimize_step += 1
+        t = self.optimize_step
+        for parameter in self.parameters:
+            if parameter.grad is None:
+                continue
+            p_id = id(parameter)
+            self.m_dict[p_id] = self.beta1 * self.m_dict[p_id] + (1 - self.beta1) * parameter.grad
+            self.v_dict[p_id] = self.beta2 * self.v_dict[p_id] + (1 - self.beta2) * np.square(parameter.grad)
+            # deviation correction
+            m_hat = self.m_dict[p_id] / (1 - self.beta1 ** t)
+            v_hat = self.v_dict[p_id] / (1 - self.beta2 ** t)
+            parameter.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
 
 # 1. 准备数据
 X_train = Variable(np.array([[1.0], [2.0], [3.0], [4.0]]))
