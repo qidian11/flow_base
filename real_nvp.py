@@ -15,7 +15,7 @@ CONFIG = {
     'n_samples': 120000,
     'bin_size': 100,
     'bootstrap_time': 2000,
-    'batch_size': 128,
+    'batch_size': 64,
 }
 
 
@@ -43,5 +43,65 @@ def get_mass_term_for_action(phi):
 
 def get_interaction_term_for_action(phi):
     return CONFIG["lam"] * Pow.apply(phi,4)
+
+
+def create_mask():
+    L = CONFIG['L']
+    indices = np.arange(L)
+    mask = (indices[:, None] + indices[None, :]) % 2 == 0
+    return mask
+
+def get_log_jacobian(phi, layers):
+    # 设置为第一层偶数格子不变
+    if len(layers) % 2 == 0:
+        mask = create_mask()
+    else:
+        mask = create_mask()
+        mask = ~mask
+    total_log_jacobian = 0
+    for layer in layers.reverse():
+        s_phi = layer.forward(phi[mask])
+        exp_s_phi = Exp.apply(s_phi)
+        jacobian = exp_s_phi.prod()
+        log_jacobian = jacobian.log()
+        total_log_jacobian += log_jacobian
+    return total_log_jacobian
+
+
+def compute_log_prior(z):
+    # It can be ignored for gradients
+    const = np.log(2 * np.pi)
+    return -0.5 * (z ** 2 + const).sum()
+
+
+class Layer:
+    def __init__(self, linear, leaky_relu):
+        self.linear = linear
+        self.leaky_relu = leaky_relu
+        self.parameters = linear.parameters()
+
+    def forward(self, phi):
+        z = self.linear.forward(phi)
+        z = self.leaky_relu(z)
+        return z
+
+
+class NVP(NN):
+    def forward(self, z):
+        mask = create_mask()
+        z_a = z[mask]
+        z_b = z[~mask]
+        for i,layer in enumerate(self.layers):
+            if i%2 == 0:
+                a = z_a
+                b = z_b
+            else:
+                a = z_b
+                b = z_a
+            s, t = layer
+            z_b = Exp.apply(-1*s.forward(a)) * (b-t.forward(a))
+
+
+
 
 

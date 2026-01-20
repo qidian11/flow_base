@@ -14,7 +14,7 @@ CONFIG = {
     'delta': 0.5,
     'save_steps': 10,
     'thermal_steps': 2000,
-    'n_samples': 120000,
+    'n_samples': 20000,
     'bin_size': 100,
     'bootstrap_time': 1000,
     'batch_size': 128,
@@ -45,7 +45,7 @@ def checkerboard_metropolis_batch(phi, mask_red, mask_black):
         # Delta S 计算 (基于 local_test_7 的 2.0 修正)
         dS_grid = (term1 * (phi_proposal ** 2 - phi ** 2) +
                    lam * (phi_proposal ** 4 - phi ** 4) -
-                   2.0 * (phi_proposal - phi) * neighbor_sum)
+                   (phi_proposal - phi) * neighbor_sum)
 
         accept_condition = (dS_grid < 0) | (torch.exp(-dS_grid) > torch.rand_like(phi))
         update_mask = mask & accept_condition
@@ -81,7 +81,7 @@ def calculate_G_t_bins(binning_ens):
         for l in range(L):
             shifted = torch.roll(binning_ens, shifts=(t, l), dims=(2, 3))
             corr = (binning_ens * shifted).mean(dim=(2, 3)).mean(dim=1)
-            G_t_l_sum.append(corr - expected_phi ** 2)
+            G_t_l_sum.append(corr - expected_phi *(shifted.mean(dim=(1, 2, 3))))
         G_t_list.append(torch.stack(G_t_l_sum).mean(dim=0))
     return torch.stack(G_t_list, dim=1)
 
@@ -100,10 +100,12 @@ def main():
 
     # 2. Sampling
     ensemble, dS_list, acc_sum = [], [], 0.0
+    acc_list = []
     steps = CONFIG['n_samples']
     for s in range(steps):
         phi, dS, acc = checkerboard_metropolis_batch(phi, mask_red, mask_black)
         acc_sum += acc
+        acc_list.append(acc)
         if s % CONFIG['save_steps'] == 0:
             ensemble.append(phi.clone().cpu())
             dS_list.append(dS.clone().cpu())

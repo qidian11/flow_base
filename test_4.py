@@ -270,6 +270,7 @@ def main():
     ensemble = []
     step = 0
     accept_count = 0
+    acc_list = []
 
     while step < CONFIG['n_samples']:
         phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, CONFIG['tao'])
@@ -279,7 +280,7 @@ def main():
             continue
 
         accept_count += avg_acc  # 累加平均接受率
-
+        acc_list.append(avg_acc)
         if step % CONFIG['save_steps'] == 0:
             # detach 并存入列表
             ensemble.append(phi.clone().detach().cpu())
@@ -296,6 +297,15 @@ def main():
     # 处理数据
     # ensemble_tensor shape: [Samples, batchsize, L, L]
     ensemble_tensor = torch.stack(ensemble, dim=0)
+    acc_arr = np.array(acc_list)
+    acc_mean = acc_arr.mean()
+    acc_std = acc_arr.std()
+    acc_error = acc_std / np.sqrt(len(acc_arr))
+
+    print(f"平均接受率 (Mean): {acc_mean:.5f}")
+    print(f"单次波动 (Std Dev): {acc_std:.5f}")
+    print(f"平均值误差 (Std Err): {acc_error:.5f}")
+
     L = CONFIG['L']
     ensemble_tensor = ensemble_tensor.transpose(0, 1).reshape(-1, L, L)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
@@ -412,8 +422,13 @@ def main():
         G_error_bar = bootstrap_ensemble_tensor.std(dim=0)
         y_err_g = G_error_bar.numpy()
         G_t = G_t_inside_bin.mean(dim=0)
-        print(f"G_t:{G_t.item():.16E}")
-        print(f"y_err_g:{y_err_g.item():.16E}")
+        print("G_t values:")
+        for t_val in G_t:
+            print(f"{t_val.item():.16E}")
+
+        print("y_err_g:")
+        for t_val in y_err_g:
+            print(f"{t_val.item():.16E}")
 
         # effective mass
         # shape=(time)
@@ -423,48 +438,58 @@ def main():
         bootstrap_effective_mass = bootstrap_effective_mass[:, 1:-1]
         e_m_error_bar = bootstrap_effective_mass.std(dim=0)
         y_err_m = e_m_error_bar.numpy()
-        # plt
-        fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+        # 1. 设置画布
+        # 两个图都是 1.4:1 的宽图，并排显示，建议把画布宽度设大一点，比如 (10, 4) 或 (12, 5)
+        fig, axs = plt.subplots(1, 2, figsize=(10, 4))
 
-        # green function
-        # axs[0].plot(G_t.numpy(), np.arange(CONFIG['L']), marker='o', linestyle='-')
+        # --- 左图：Green Function G(t) ---
+
+        # 设置宽高比 W:H = 1.4:1 -> H/W = 1/1.4
+        axs[0].set_box_aspect(1 / 1.6875)
+
         axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
         axs[0].errorbar(
             np.arange(len(G_t.numpy())),
             G_t.numpy(),
             yerr=y_err_g,
-            fmt='-o',  # 格式字符串: '-'代表连线, 'o'代表画点
-            color='blue',  # 线和点的颜色
-            ecolor='purple',  # error bar 的颜色 (设为不同颜色方便看清)
-            capsize=4,  # 误差棒两端“帽子”横线的宽度
-            elinewidth=1.5,  # 误差棒线条的粗细
-            label='Lattice Data'  # 图例标签
+            fmt='-o',  # 格式: '-'连线, 'o'点
+            color='blue',  # 数据颜色
+            ecolor='purple',  # 误差棒颜色
+            capsize=4,  # 误差棒帽子宽度
+            elinewidth=1.5,  # 误差棒线宽
+            label='Lattice Data'
         )
         axs[0].set_yscale('log')
         axs[0].set_xlabel('Time Separation (t)')
         axs[0].set_ylabel('G(t) (Connected)')
         axs[0].set_title(f'2-point function (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
-        axs[0].grid(True, which="both", ls="--")
+        axs[0].grid(True, which="both", ls="--", alpha=0.5)  # 加了 alpha 让网格淡一点，不抢眼
+        axs[0].legend()  # 显示图例
 
-        # effective mass
-        # axs[1].plot(effective_mass.numpy(), np.arange(1, CONFIG['L']-1), marker='o', linestyle='-')
+        # --- 右图：Effective Mass ---
+
+        # 设置宽高比 W:H = 1.4:1
+        axs[1].set_box_aspect(1 / 1.6875)
+
         axs[1].xaxis.set_major_locator(MaxNLocator(integer=True))
         axs[1].errorbar(
-            np.arange(len(e_m_error_bar.numpy())),
+            np.arange(len(e_m_error_bar.numpy())),  # 假设这是对应的时间切片长度
             effective_mass.numpy(),
             yerr=y_err_m,
-            fmt='-o',  # 格式字符串: '-'代表连线, 'o'代表画点
-            color='blue',  # 线和点的颜色
-            ecolor='purple',  # error bar 的颜色 (设为不同颜色方便看清)
-            capsize=4,  # 误差棒两端“帽子”横线的宽度
-            elinewidth=1.5,  # 误差棒线条的粗细
-            label='Lattice Data'  # 图例标签
+            fmt='-o',
+            color='blue',
+            ecolor='purple',
+            capsize=4,
+            elinewidth=1.5,
+            label='Lattice Data'
         )
         axs[1].set_xlabel('Time Separation (t)')
-        axs[1].set_ylabel('effective mass')
-        axs[1].set_title(f'effective mass (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
-        # axs[1].grid(True, which="both", ls="--")
+        axs[1].set_ylabel('Effective Mass')
+        axs[1].set_title(f'Effective Mass (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
+        # axs[1].grid(True, which="both", ls="--") # 你之前注释掉了，我也保持注释状态
+        axs[1].legend()
 
+        # 3. 布局调整与显示
         plt.tight_layout()
         plt.show()
     except Exception as e:

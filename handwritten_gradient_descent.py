@@ -1,4 +1,5 @@
 import numpy as np
+from torch.fx.experimental.migrate_gradual_types.constraint import Prod
 
 
 class Context:
@@ -21,7 +22,10 @@ class Function:
     @classmethod
     def apply(cls, *inputs):
         ctx = Context()
-        input_data = [x.data if isinstance(x, Variable) else x for x in inputs]
+        input_data = [
+            x.data if isinstance(x, Variable) else np.asarray(x)
+            for x in inputs
+        ]
         output_data = cls.forward(ctx, *input_data)
 
         func_node = FunctionNode(ctx, cls, inputs)
@@ -73,6 +77,9 @@ class Variable:
     def relu(self):
         return ReLU.apply(self)
 
+    def leaky_relu(self):
+        return LeakyReLU.apply(self)
+
     def sum(self):
         # 这里的 self 就是调用 sum 的那个 Variable 对象
         return Sum.apply(self)
@@ -85,6 +92,9 @@ class Variable:
 
     def roll(self, shift, axis):
         return Roll.apply(self, shift, axis)
+
+    def prod(self):
+        return Product.apply(self)
 
 
     def enable_history(self):
@@ -230,6 +240,34 @@ class Exp(Function):
         a, = ctx.save_tensors
         grad = grad_output * np.exp(a)
         return grad
+
+class Product(Function):
+    @staticmethod
+    def forward(ctx, a):
+        ctx.save_for_backward(a)
+        return np.prod(a)
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, = ctx.save_tensors
+
+        grad = np.zeros_like(a)
+
+        zero_mask = (a == 0)
+        num_zero = np.sum(zero_mask)
+
+        if num_zero == 0:
+            total = np.prod(a)
+            grad = total / a
+
+        elif num_zero == 1:
+            idx = np.where(zero_mask)[0][0]
+            prod_non_zero = np.prod(a[~zero_mask])
+            grad[idx] = prod_non_zero
+
+        # num_zero >= 2 时，梯度全为 0，已经初始化好了
+
+        return grad_output * grad
+
 
 class Pow(Function):
     @staticmethod
