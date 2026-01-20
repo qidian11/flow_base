@@ -96,6 +96,9 @@ class Variable:
     def prod(self):
         return Product.apply(self)
 
+    def shape(self):
+        return self.data.shape
+
 
     def enable_history(self):
         self.store_history = True
@@ -355,6 +358,59 @@ class Mean(Function):
         a_shape, = ctx.save_tensors
         numel = np.prod(a_shape)
         return np.broadcast_to(grad_output/numel, a_shape)
+
+class MaskSelect(Function):
+    @staticmethod
+    def forward(ctx, x, mask):
+        ctx.save_for_backward(mask,x.shape)
+        return x[mask]
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        mask, x_shape = ctx.save_tensors
+        grad = np.zeros(x_shape, dtype=grad_output.dtype)
+        grad[mask] = grad_output
+        return grad, None
+
+class Combine(Function):
+    @staticmethod
+    def forward(ctx, z_a, z_b, mask):
+        ctx.save_for_backward(mask)
+        # 创建空数组
+        res = np.zeros(mask.shape, dtype=z_a.dtype)
+        # 填入数据
+        res[mask] = z_a
+        res[~mask] = z_b
+        return res
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        mask, = ctx.save_tensors
+        # 将传入的完整梯度拆分回两部分
+        grad_a = grad_output[mask]
+        grad_b = grad_output[~mask]
+        return grad_a, grad_b, None
+
+# 不需要to grid，combine已经完成了
+# class ToGrid(Function):
+#     @staticmethod
+#     def forward(ctx, z):
+#         ctx.save_for_backward(z.shape)
+#         L = int(np.sqrt(len(z)))
+#         z2d = z[:L * L].reshape(L, L)
+#         return z2d
+#     @staticmethod
+#     def backward(grad_output, ctx):
+#         z_shape, = ctx.save_tensors
+#         grad = grad_output.reshape(-1)
+#         n = int(np.prod(z_shape))
+#         if grad.size < n:
+#             pad_width = n - grad.size
+#             grad = np.pad(grad, (0, pad_width), mode='constant')
+#
+#         out = grad[:n].reshape(z_shape)
+#         return out
+
 # test
 # x = Variable(2.0)
 # y = Variable(3.0)

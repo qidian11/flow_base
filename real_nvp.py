@@ -67,6 +67,11 @@ def get_log_jacobian(phi, layers):
         total_log_jacobian += log_jacobian
     return total_log_jacobian
 
+def mask_select(x, mask):
+    return MaskSelect.apply(x, mask)
+
+def combine(z_a, z_b, mask):
+    return Combine.apply(z_a, z_b, mask)
 
 def compute_log_prior(z):
     # It can be ignored for gradients
@@ -88,18 +93,14 @@ class Layer:
 
 class NVP(NN):
     def forward(self, z):
-        mask = create_mask()
-        z_a = z[mask]
-        z_b = z[~mask]
+        base_mask = create_mask()
         for i,layer in enumerate(self.layers):
-            if i%2 == 0:
-                a = z_a
-                b = z_b
-            else:
-                a = z_b
-                b = z_a
+            mask = ~base_mask
+            z_a = mask_select(z, mask)
+            z_b = mask_select(z, ~mask)
             s, t = layer
-            z_b = Exp.apply(-1*s.forward(a)) * (b-t.forward(a))
+            z_b = Exp.apply(-1*s.forward(z_a)) * (z_b-t.forward(z_a))
+        return z_a,z_b
 
 
 
