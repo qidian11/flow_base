@@ -482,20 +482,20 @@ class Linear:
 class NN:
     def __init__(self, layers):
         self.layers = layers
-        self.parameters = []
+        self.params = []
         self.set_all_parameters()
         self.loss = None
 
     def set_all_parameters(self):
         for layer in self.layers:
             if isinstance(layer, Linear):
-                self.parameters += layer.parameters()
+                self.params += layer.parameters()
 
     def parameters(self):
-        return self.parameters
+        return self.params
 
     def clear_gradient(self):
-        for parameter in self.parameters:
+        for parameter in self.params:
             parameter.clear_grad()
 
     def forward(self, x):
@@ -540,37 +540,37 @@ class Adam(Optimizer):
             v_hat = self.v_dict[p_id] / (1 - self.beta2 ** t)
             parameter.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
 
-# 1. 准备数据
-X_train = Variable(np.array([[1.0], [2.0], [3.0], [4.0]]))
-Y_true = Variable(np.array([[3.0], [5.0], [7.0], [9.0]]))
-
-# 2. 实例化模型
-model = Linear(1, 1)
-learning_rate = 0.01
-
-# 3. 训练迭代
-for epoch in range(100):
-    # --- 前向传播 ---
-    Y_pred = model.forward(X_train)
-
-    # --- 计算 Loss (均方误差 MSE) ---
-    diff = Y_pred + (Y_true * -1.0)  # 简易实现 y_pred - y_true
-    loss = (diff * diff)  # 简易平方
-    loss_val = np.mean(loss.data)
-
-    # --- 反向传播 ---
-    # 每次反向传播前，手动清空之前的梯度 (Zero Grad)
-    for p in model.parameters():
-        p.grad = None
-
-    loss.backward()
-
-    # --- 梯度下降更新权重 (Optimizer Step) ---
-    for p in model.parameters():
-        # p.data = p.data - lr * p.grad
-        p.data -= learning_rate * p.grad
-
-    if epoch % 20 == 0:
-        print(f"Epoch {epoch}, Loss: {loss_val:.4f}")
-
-print(f"\n训练完成！权重 W: {model.W.data[0][0]:.2f}, 偏置 b: {model.b.data[0]:.2f}")
+# # 1. 准备数据
+# X_train = Variable(np.array([[1.0], [2.0], [3.0], [4.0]]))
+# Y_true = Variable(np.array([[3.0], [5.0], [7.0], [9.0]]))
+#
+# # 2. 实例化模型
+# model = Linear(1, 1)
+# learning_rate = 0.01
+#
+# # 3. 训练迭代
+# for epoch in range(100):
+#     # --- 前向传播 ---
+#     Y_pred = model.forward(X_train)
+#
+#     # --- 计算 Loss (均方误差 MSE) ---
+#     diff = Y_pred + (Y_true * -1.0)  # 简易实现 y_pred - y_true
+#     loss = (diff * diff)  # 简易平方
+#     loss_val = np.mean(loss.data)
+#
+#     # --- 反向传播 ---
+#     # 每次反向传播前，手动清空之前的梯度 (Zero Grad)
+#     for p in model.parameters():
+#         p.grad = None
+#
+#     loss.backward()
+#
+#     # --- 梯度下降更新权重 (Optimizer Step) ---
+#     for p in model.parameters():
+#         # p.data = p.data - lr * p.grad
+#         p.data -= learning_rate * p.grad
+#
+#     if epoch % 20 == 0:
+#         print(f"Epoch {epoch}, Loss: {loss_val:.4f}")
+#
+# print(f"\n训练完成！权重 W: {model.W.data[0][0]:.2f}, 偏置 b: {model.b.data[0]:.2f}")

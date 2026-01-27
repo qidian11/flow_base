@@ -3,7 +3,6 @@ from sympy.physics.mechanics import kinetic_energy
 
 from handwritten_gradient_descent import *
 
-
 CONFIG = {
     'L': 14,
     'm2': -4.0,
@@ -15,7 +14,7 @@ CONFIG = {
     'n_samples': 120000,
     'bin_size': 100,
     'bootstrap_time': 2000,
-    'batch_size': 64,
+    'batch_size': 128,
 }
 
 
@@ -49,7 +48,7 @@ def create_mask():
     L = CONFIG['L']
     indices = np.arange(L)
     mask = (indices[:, None] + indices[None, :]) % 2 == 0
-    return mask
+    return mask.flatten()
 
 def get_log_jacobian(phi, layers):
     # 设置为第一层偶数格子不变
@@ -92,14 +91,21 @@ class Layer:
 
 
 class PhiToZNVP(NN):
+    def set_all_parameters(self):
+        self.params = []  # 确保这里使用你刚才修改后的变量名 (self.params)
+        for layer in self.layers:
+            s_net, t_net = layer
+            # 递归收集 s_net 和 t_net 的参数
+            self.params += s_net.parameters()
+            self.params += t_net.parameters()
+
     def compute_loss(self, z, log_total_jacobian):
-        log_r_z = -(z**2) * 0.5
+        log_r_z = (-0.5*(z**2)).sum()
         loss = -log_r_z - log_total_jacobian
         return loss
 
     def forward(self, phi):
         z = phi
-        origin_phi = phi.copy()
         base_mask = create_mask()
         log_total_jacobian = 0
         for i,layer in enumerate(self.layers):
@@ -122,9 +128,66 @@ class PhiToZNVP(NN):
         self.loss = loss
         return self.loss
 
+L = CONFIG['L']
+split_dim = L*L // 2
+hidden_dim = 128
+coupling_layer_num = 8
+
+def create_st_network(input_dim, hidden_dim):
+    return NN([
+        Layer(Linear(input_dim, hidden_dim), LeakyReLU()),
+        Layer(Linear(hidden_dim,hidden_dim), LeakyReLU()),
+        Linear(hidden_dim, input_dim)
+    ])
+
+coupling_layers = []
+for i in range(coupling_layer_num):
+    s_net = create_st_network(split_dim, hidden_dim)
+    t_net = create_st_network(split_dim, hidden_dim)
+    coupling_layers.append((s_net, t_net))
+
+phi_to_znvp = PhiToZNVP(coupling_layers)
+
+filename = "configs_L14_N12800.npy"
+
+try:
+    # 2. 加载数据
+    phi_hmc_all = np.load(filename)
+
+    print(f"✅ File read successfully: {filename}")
+    print(f"Data Shape: {phi_hmc_all.shape}")
 
 
+    print(f"Data Type(Dtype): {phi_hmc_all.dtype}")
 
 
+except FileNotFoundError:
+    print(f"❌ File not found: {filename}，please check the path.。")
 
 
+optimizer = Adam(phi_to_znvp.parameters())
+N_SAMPLES = phi_hmc_all.shape[0]
+BATCH_SIZE = CONFIG['batch_size']
+epochs = 100
+
+for epoch in range(epochs):
+
+    # 1. 【关键步骤】生成打乱的索引
+    # np.random.permutation(N) 会生成一个 0 到 N-1 的随机排列数组
+    # 例如 N=5 -> [3, 0, 4, 1, 2]
+    shuffled_indices = np.random.permutation(N_SAMPLES)
+
+    # 2. 按 Batch_Size 步长遍历
+    for i in range(0, N_SAMPLES, BATCH_SIZE):
+        current_indices = shuffled_indices[i: i + BATCH_SIZE]
+
+        phi_batch_np = phi_hmc_all[current_indices]
+
+        phi_batch = Variable(phi_batch_np)
+
+        loss = phi_to_znvp.forward(phi_batch)
+        phi_to_znvp.clear_gradient()
+        phi_to_znvp.backward()
+        optimizer.optimize()
+
+    print(f"Epoch {epoch} finished.")
