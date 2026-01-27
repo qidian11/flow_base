@@ -91,16 +91,38 @@ class Layer:
         return z
 
 
-class NVP(NN):
-    def forward(self, z):
+class PhiToZNVP(NN):
+    def compute_loss(self, z, log_total_jacobian):
+        log_r_z = -(z**2) * 0.5
+        loss = -log_r_z - log_total_jacobian
+        return loss
+
+    def forward(self, phi):
+        z = phi
+        origin_phi = phi.copy()
         base_mask = create_mask()
+        log_total_jacobian = 0
         for i,layer in enumerate(self.layers):
-            mask = ~base_mask
+            if i % 2 == 0:
+                mask = base_mask
+            else:
+                mask = ~base_mask
+
             z_a = mask_select(z, mask)
             z_b = mask_select(z, ~mask)
             s, t = layer
-            z_b = Exp.apply(-1*s.forward(z_a)) * (z_b-t.forward(z_a))
-        return z_a,z_b
+            s_out = s.forward(z_a)
+            t_out = t.forward(z_a)
+
+            z_b = Exp.apply(s_out) * z_b + t_out
+
+            log_total_jacobian += s_out.sum()
+            z = combine(z_a, z_b, mask)
+        loss = self.compute_loss(z, log_total_jacobian)
+        self.loss = loss
+        return self.loss
+
+
 
 
 

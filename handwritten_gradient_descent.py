@@ -73,6 +73,11 @@ class Variable:
         # 当执行 2.0 * self 时被触发
         return self.__mul__(other)
 
+    def __pow__(self, power):
+        if not isinstance(power, (int, float)):
+            raise TypeError("Power must be a number")
+        return Pow.apply(self, power)
+
     # 在 Variable 类中添加快捷方式
     def relu(self):
         return ReLU.apply(self)
@@ -479,11 +484,15 @@ class NN:
         self.layers = layers
         self.parameters = []
         self.set_all_parameters()
+        self.loss = None
 
     def set_all_parameters(self):
         for layer in self.layers:
             if isinstance(layer, Linear):
                 self.parameters += layer.parameters()
+
+    def parameters(self):
+        return self.parameters
 
     def clear_gradient(self):
         for parameter in self.parameters:
@@ -495,10 +504,11 @@ class NN:
           data = layer.forward(data)
         return data
 
-    def backward(self, loss, optimizer):
+    def backward(self):
         self.clear_gradient()
-        loss.backward()
-        optimizer.optimize(self.layers)
+        if self.loss is None:
+            raise ValueError("loss must be set before calling backward()")
+        self.loss.backward()
 
 
 class Optimizer:
