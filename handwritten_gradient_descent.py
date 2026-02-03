@@ -51,6 +51,27 @@ class Variable:
         self.grad = None
         self.generation = 0 if function_node is None else function_node.generation
 
+    def __neg__(self):
+        # 处理 -self
+        return Neg.apply(self)
+
+    def __sub__(self, other):
+        # 处理 self - other
+        return Sub.apply(self, other)
+
+    def __rsub__(self, other):
+        # 处理 2.0 - self
+        # 等价于 -(self - other)
+        return Sub.apply(other, self)
+
+    def __truediv__(self, other):
+        # 处理 self / other
+        return Div.apply(self, other)
+
+    def __rtruediv__(self, other):
+        # 处理 float / self
+        return Div.apply(other, self)
+
     def __mul__(self, other):
         # 当执行 x * y 时，自动调用 Mul.apply
         return Mul.apply(self, other)
@@ -237,6 +258,45 @@ class Add(Function):
 
         return grad_a, grad_b
 
+
+class Neg(Function):
+    @staticmethod
+    def forward(ctx, a):
+        # 不需要存储额外信息，直接返回 -a
+        return -a
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        # -a 的导数是 -1
+        return -grad_output
+
+class Sub(Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        ctx.save_for_backward(a, b)
+        return a - b
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, b = ctx.save_tensors
+        grad_a = grad_output.copy()
+        grad_b = -grad_output.copy()
+
+        # 处理广播逻辑（逻辑同 Add 算子）
+        for i, (input_arr, grad_val) in enumerate([(a, grad_a), (b, grad_b)]):
+            res_grad = grad_val
+            if np.ndim(input_arr) < np.ndim(grad_output):
+                res_grad = np.sum(res_grad, axis=tuple(range(np.ndim(grad_output) - np.ndim(input_arr))))
+
+            if res_grad.shape != input_arr.shape:
+                axes = tuple(idx for idx, (d_in, d_g) in enumerate(zip(input_arr.shape, res_grad.shape)) if d_in < d_g)
+                res_grad = np.sum(res_grad, axis=axes, keepdims=True)
+
+            if i == 0: grad_a = res_grad
+            else: grad_b = res_grad
+
+        return grad_a, grad_b
+
 class Exp(Function):
     @staticmethod
     def forward(ctx, a):
@@ -364,6 +424,38 @@ class Mean(Function):
         numel = np.prod(a_shape)
         return np.broadcast_to(grad_output/numel, a_shape)
 
+
+class Div(Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        # 转换为 numpy 数组进行计算
+        ctx.save_for_backward(a, b)
+        return a / b
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        a, b = ctx.save_tensors
+        # a / b 的导数：
+        # 对 a 求导是 1/b
+        # 对 b 求导是 -a/(b^2)
+        grad_a = grad_output / b
+        grad_b = -grad_output * a / (b**2)
+
+        # 处理广播逻辑（由于除法通常用于 Variable / scalar，这里的广播很重要）
+        for i, (input_arr, grad_val) in enumerate([(a, grad_a), (b, grad_b)]):
+            res_grad = grad_val
+            if np.ndim(input_arr) < np.ndim(grad_output):
+                res_grad = np.sum(res_grad, axis=tuple(range(np.ndim(grad_output) - np.ndim(input_arr))))
+
+            if res_grad.shape != input_arr.shape:
+                axes = tuple(idx for idx, (d_in, d_g) in enumerate(zip(input_arr.shape, res_grad.shape)) if d_in < d_g)
+                res_grad = np.sum(res_grad, axis=axes, keepdims=True)
+
+            if i == 0: grad_a = res_grad
+            else: grad_b = res_grad
+
+        return grad_a, grad_b
+
 class MaskSelect(Function):
     @staticmethod
     def forward(ctx, x, mask):
@@ -376,6 +468,29 @@ class MaskSelect(Function):
         grad = np.zeros(x_shape, dtype=grad_output.dtype)
         grad[mask] = grad_output
         return grad, None
+
+
+class MaskSelectForBatch(Function):
+    @staticmethod
+    def forward(ctx, x, mask):
+        # x: (batch, L*L), mask: (batch, L*L)
+        batch_size = x.shape[0]
+        # 提取 mask 为 True 的元素
+        # 在 batch 维度一致的情况下，res_data 会被拉平，所以我们要 reshape 回去
+        res_data = x[mask].reshape(batch_size, -1)
+        ctx.save_for_backward(mask, x.shape)
+        return res_data
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        # grad_output: (batch, split_dim)
+        mask, x_shape = ctx.save_tensors
+        grad = np.zeros(x_shape, dtype=grad_output.dtype)
+
+        # 将梯度填回对应的位置
+        grad[mask] = grad_output.ravel()
+        return grad, None
+
 
 class Combine(Function):
     @staticmethod
@@ -395,6 +510,31 @@ class Combine(Function):
         grad_a = grad_output[mask]
         grad_b = grad_output[~mask]
         return grad_a, grad_b, None
+
+
+class CombineForBatch(Function):
+    @staticmethod
+    def forward(ctx, z_a, z_b, mask):
+        # z_a, z_b: (batch, split_dim), mask: (batch, L*L)
+        ctx.save_for_backward(mask)
+        res = np.zeros(mask.shape, dtype=z_a.dtype)
+
+        # 使用 ravel() 确保数据能够正确填充进布尔索引位置
+        res[mask] = z_a.ravel()
+        res[~mask] = z_b.ravel()
+        return res
+
+    @staticmethod
+    def backward(grad_output, ctx):
+        # grad_output: (batch, L*L)
+        mask, = ctx.save_tensors
+        batch_size = grad_output.shape[0]
+
+        # 提取梯度并恢复 batch 形状
+        grad_a = grad_output[mask].reshape(batch_size, -1)
+        grad_b = grad_output[~mask].reshape(batch_size, -1)
+        return grad_a, grad_b, None
+
 
 # 不需要to grid，combine已经完成了
 # class ToGrid(Function):
@@ -467,10 +607,26 @@ class LeakyReLU(Function):
         x_grad[x <= 0] = alpha
         return grad_output * x_grad
 
+
+class Layer:
+    def __init__(self, linear, leaky_relu):
+        self.linear = linear
+        self.leaky_relu = leaky_relu
+        self.parameters = linear.parameters()
+
+    def parameters(self):
+        return self.parameters
+
+    def forward(self, phi):
+        z = self.linear.forward(phi)
+        z = self.leaky_relu.apply(z)
+        return z
+
+
 class Linear:
     def __init__(self, in_features, out_features):
         # 随机初始化权重 (Xavier/He 初始化思路)
-        self.W = Variable(np.random.randn(in_features, out_features) * 0.1)
+        self.W = Variable(np.random.normal(loc=0.0, scale=0.001, size=(in_features, out_features)))
         self.b = Variable(np.zeros(out_features))
 
     def forward(self, x):
@@ -488,7 +644,11 @@ class NN:
 
     def set_all_parameters(self):
         for layer in self.layers:
-            if isinstance(layer, Linear):
+            if hasattr(layer, 'parameters'):
+                # 兼容方法调用和直接属性
+                p = layer.parameters() if callable(layer.parameters) else layer.parameters
+                self.params += p
+            elif isinstance(layer, Linear):
                 self.params += layer.parameters()
 
     def parameters(self):
