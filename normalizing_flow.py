@@ -8,23 +8,23 @@ device = torch.device("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available(
 print(f"Running on: {device}")
 
 
-# 1. 保持与你代码一致的配置
+# 1. 配置
 CONFIG = {
     'L': 14,
     'batch_size': 1024,
-    'lr': 1e-4,  # 你可以尝试 1e-4 来观察更平滑的下降
+    'lr': 1e-4,
     'epochs': 10000
 }
 
 
-# 2. 掩码生成 (PyTorch 张量版)
+# 2. 掩码生成
 def create_mask(L):
     indices = torch.arange(L)
     mask_2d = (indices[:, None] + indices[None, :]) % 2 == 0
     return mask_2d.flatten()  # 返回 (L*L,) 的布尔张量
 
 
-# 3. 定义 s 和 t 网络 (对应你的 create_st_network)
+# 3. 定义 s 和 t 网络
 class StNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
@@ -36,7 +36,7 @@ class StNetwork(nn.Module):
             nn.Linear(hidden_dim, input_dim)
         )
 
-        # 初始化权重为接近 0，模拟你的“从恒等变换开始”
+        # 初始化权重为接近 0，从恒等变换开始
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0, std=0.001)
@@ -74,7 +74,6 @@ class RealNVPtorch(nn.Module):
             t_out = self.t_nets[i](z_a)
 
             # 耦合变换: z_b = z_b * exp(s) + t
-            # 为了数值稳定，PyTorch 建议对 s 进行 tanh 限制或 clip，但这里遵循你的逻辑
             z_b = z_b * torch.exp(s_out) + t_out
 
             # 累加 Log-Jacobian
@@ -98,7 +97,7 @@ class RealNVPtorch(nn.Module):
 
 # 5. 模拟训练流程
 def train():
-    # 加载你的数据 (假设已经转为 float32)
+    # 加载数据
     data_np = np.load("configs_L14_N12800.npy").reshape(-1, 14, 14).astype(np.float64)
     dataset = torch.from_numpy(data_np)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=CONFIG['batch_size'], shuffle=True)
@@ -127,7 +126,7 @@ def train():
 
         avg_loss = epoch_loss / len(dataloader)
         # scheduler.step(avg_loss)
-        # 打印当前学习率（可选，用于观察）
+        # 打印当前学习率
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch}, Loss: {avg_loss:.4f}, Current LR: {current_lr}")
 
