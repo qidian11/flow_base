@@ -9,7 +9,7 @@ def load_trained_model(checkpoint_path, L):
     # map_location 确保在没有 GPU 的机器上也能加载
     state_dict = torch.load(checkpoint_path, map_location=device)
 
-    # 如果你保存的是整个 dict (包含 optimizer)，则取 model_state_dict
+    # 如果保存的是整个 dict (包含 optimizer)，则取 model_state_dict
     if 'model_state_dict' in state_dict:
         model.load_state_dict(state_dict['model_state_dict'])
     else:

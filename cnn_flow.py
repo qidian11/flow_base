@@ -81,7 +81,7 @@ class ConvContextNet(nn.Module):
 # 4. 流模型定义 (完全生成模式)
 # ==========================================
 class FlowModel(nn.Module):
-    def __init__(self, L, coupling_layers=12):  # 12个耦合层 [cite: 2587]
+    def __init__(self, L, coupling_layers=12):  # 12个耦合层
         super().__init__()
         self.L = L
         self.coupling_layers = coupling_layers
@@ -141,7 +141,7 @@ def train():
 
     history_loss = []
     best_loss = float('inf')
-    save_path = "best_flow_model.pt"
+    save_path = "best_cnn_model.pt"
 
     model.train()
     print("开始自训练...")

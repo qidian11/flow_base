@@ -43,7 +43,6 @@ DTYPE = torch.float64
 
 def calculate_action(phi):
     # phi shape: [batchsize, L, L]
-    # 这里的维度变成了 0 和 1
     phi_up = torch.roll(phi, shifts=-1, dims=1)
     phi_down = torch.roll(phi, shifts=1, dims=1)
     phi_right = torch.roll(phi, shifts=1, dims=2)
