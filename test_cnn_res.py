@@ -1,11 +1,15 @@
 import torch
 import numpy as np
-from cnn_flow import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
+from cnn_res_net import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
 
 
-def load_trained_model(checkpoint_path, L, coupling_layers):
+def load_trained_model(checkpoint_path, L, coupling_layers=16, hidden_channels=16,
+                      num_hidden_layers=12):
     """加载保存的模型权重"""
-    model = FlowModel(L=L,coupling_layers=coupling_layers).to(device)
+    model = FlowModel(L=L,coupling_layers=coupling_layers,
+                      hidden_channels=hidden_channels,
+                      num_hidden_layers=num_hidden_layers
+                      ).to(device)
     # map_location 确保在没有 GPU 的机器上也能加载
     state_dict = torch.load(checkpoint_path, map_location=device)
 
@@ -78,7 +82,10 @@ if __name__ == "__main__":
     # 假设你的模型保存在这里
     # PATH = "best_cnn_model.pt"
     PATH = CONFIG['save_path']
-    trained_model = load_trained_model(PATH, CONFIG['L'], CONFIG['coupling_layers'])
+    trained_model = load_trained_model(PATH, CONFIG['L'],
+                                       coupling_layers=CONFIG['coupling_layers'],
+                                       hidden_channels=CONFIG['hidden_channels'],
+                                        num_hidden_layers=CONFIG['hidden_layers'])
 
     # 生成 10,000 个构型
     final_configs = produce_ensemble(trained_model, total_n=10000)

@@ -19,11 +19,11 @@ CONFIG = {
     'lr': 1e-3,  # 学习率
     'iterations': 20000,  # 训练迭代次数 [cite: 2615]
     'coupling_layers': 16,
-    'hidden_layers': 12,
+    'hidden_layers': 6, # 实际上是6*2
     'hidden_channels': 16,
 }
-save_path = f"best_cnn_model_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"cnn_model_loss_history_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_iterations_{CONFIG['iterations']}.npy"
+save_path = f"best_cnn_res_model_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"cnn_res_model_loss_history_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
 
@@ -62,34 +62,47 @@ def create_checkerboard_mask(L):
     return mask_2d.view(1, 1, L, L).float()
 
 
-class ConvContextNet(nn.Module):
-    def __init__(self, hidden_channels=3,num_hidden_layers=8):
+# 【新增】定义一个标准的残差块
+class ResBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        # 结构: 单通道输入, 4层隐藏层(各8通道), 3x3卷积核, stride=1, 周期性填充
+        # 保持通道数不变的两次卷积
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode='circular')
+        self.act1 = nn.LeakyReLU(0.01)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode='circular')
+        self.act2 = nn.LeakyReLU(0.01)
+
+    def forward(self, x):
+        # 残差连接加在这里！只在同等维度的隐藏特征之间相加
+        return x + self.act2(self.conv2(self.act1(self.conv1(x))))
+
+
+class ConvContextNet(nn.Module):
+    def __init__(self, hidden_channels=8, num_hidden_layers=4):
+        super().__init__()
         layers = []
 
-        # 1. 输入层：1 通道 -> hidden_channels
+        # 1. 升维映射：1 通道 -> hidden_channels (把单通道的物理场升维成多通道特征)
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1, padding=1, padding_mode='circular'))
-        layers.append(nn.LeakyReLU(0.01))  #
+        layers.append(nn.LeakyReLU(0.01))
 
-        # 2. 预设数量的隐藏层：hidden_channels -> hidden_channels
+        # 2. 预设数量的残差块 (特征提取阶段，疯狂堆叠深度，且不会梯度消失)
         for _ in range(num_hidden_layers):
-            layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1,
-                                    padding_mode='circular'))
-            layers.append(nn.LeakyReLU(0.01))
+            layers.append(ResBlock(hidden_channels))
 
-        # 3. 输出层：hidden_channels -> 2 通道 (对应 s 和 t)
+        # 3. 输出层：hidden_channels -> 2 通道 (把多通道特征降维成我们需要的 s 和 t)
         layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=3, stride=1, padding=1, padding_mode='circular'))
 
-        # 使用 * 解包列表，自动构建 Sequential
+        # 自动构建 Sequential
         self.net = nn.Sequential(*layers)
-
 
         # 初始化
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight, mean=0, std=0.01)
                 nn.init.constant_(m.bias, 0)
+
+        # 【极其关键】强制最后一层零初始化！防止深层网络起步爆炸
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -101,12 +114,15 @@ class ConvContextNet(nn.Module):
 # 4. 流模型定义 (完全生成模式)
 # ==========================================
 class FlowModel(nn.Module):
-    def __init__(self, L, hidden_channels=16, coupling_layers=12):  # 默认12个耦合层
+    def __init__(self, L, coupling_layers=12, hidden_channels=16, num_hidden_layers=12):  # 默认12个耦合层
         super().__init__()
         self.L = L
         self.coupling_layers = coupling_layers
         self.register_buffer('base_mask', create_checkerboard_mask(L))
-        self.context_nets = nn.ModuleList([ConvContextNet(num_hidden_layers=CONFIG['hidden_layers']) for _ in range(coupling_layers)])
+        self.context_nets = nn.ModuleList(
+            [ConvContextNet(hidden_channels=hidden_channels,
+                            num_hidden_layers=num_hidden_layers)
+             for _ in range(coupling_layers)])
 
     def forward(self, z):
         """
@@ -156,7 +172,9 @@ class FlowModel(nn.Module):
 # ==========================================
 def train(save_path, loss_save_path):
     L = CONFIG['L']
-    model = FlowModel(L=L,hidden_channels=CONFIG['hidden_channels'], coupling_layers=CONFIG['coupling_layers']).to(device)
+    model = FlowModel(L=L,coupling_layers=CONFIG['coupling_layers'],
+                      hidden_channels=CONFIG['hidden_channels'],
+                      num_hidden_layers=CONFIG['hidden_layers']).to(device)
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
     # 【新增】定义余弦退火学习率调度器
     # T_max 是总迭代次数，eta_min 是最后降到的最小学习率
@@ -185,11 +203,8 @@ def train(save_path, loss_save_path):
         loss = torch.mean(log_q + S_phi)
 
         loss.backward()
-        # 限制最大梯度范数为 5.0
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-
         optimizer.step()
-        # 每次迭代后更新一次学习率
+        # 【新增】每次迭代后更新一次学习率
         scheduler.step()
 
         loss_val = loss.item()
@@ -206,13 +221,12 @@ def train(save_path, loss_save_path):
                 'loss': loss_val,
             }, "latest_checkpoint.pt")
 
+        # 如果 Loss 创新低，保存最优模型
         if loss_val < best_loss and iteration >= 10000:
             best_loss = loss_val
             torch.save(model.state_dict(), save_path)
         if iteration % 1000 == 0:
             np.save(loss_save_path, np.array(history_loss))
-
-    np.save(loss_save_path, np.array(history_loss))
     print("100,000 times training finished！")
 
 
