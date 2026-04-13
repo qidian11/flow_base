@@ -106,7 +106,9 @@ class FlowModel(nn.Module):
         self.L = L
         self.coupling_layers = coupling_layers
         self.register_buffer('base_mask', create_checkerboard_mask(L))
-        self.context_nets = nn.ModuleList([ConvContextNet(num_hidden_layers=CONFIG['hidden_layers']) for _ in range(coupling_layers)])
+        self.context_nets = nn.ModuleList([ConvContextNet(hidden_channels=hidden_channels,
+                                        num_hidden_layers=CONFIG['hidden_layers'])
+                                           for _ in range(coupling_layers)])
 
     def forward(self, z):
         """
@@ -156,7 +158,8 @@ class FlowModel(nn.Module):
 # ==========================================
 def train(save_path, loss_save_path):
     L = CONFIG['L']
-    model = FlowModel(L=L,hidden_channels=CONFIG['hidden_channels'], coupling_layers=CONFIG['coupling_layers']).to(device)
+    model = FlowModel(L=L,hidden_channels=CONFIG['hidden_channels'],
+                      coupling_layers=CONFIG['coupling_layers']).to(device)
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
     # 【新增】定义余弦退火学习率调度器
     # T_max 是总迭代次数，eta_min 是最后降到的最小学习率
