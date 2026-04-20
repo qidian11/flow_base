@@ -10,6 +10,9 @@ def load_trained_model(checkpoint_path, L, coupling_layers=16, hidden_channels=1
                       hidden_channels=hidden_channels,
                       num_hidden_layers=num_hidden_layers
                       ).to(device)
+    if CONFIG.get('double precision', False): # 开启双精度
+        # 显式转换为双精度
+        model = model.double()
     # map_location 确保在没有 GPU 的机器上也能加载
     state_dict = torch.load(checkpoint_path, map_location=device)
 
@@ -23,7 +26,7 @@ def load_trained_model(checkpoint_path, L, coupling_layers=16, hidden_channels=1
     return model
 
 
-def produce_ensemble(model, total_n=10000, batch_size=1024):
+def produce_ensemble(model, total_n=100000, batch_size=1024):
     """
     批量生成物理构型集成
     1. 并行生成 Proposal
@@ -56,7 +59,15 @@ def produce_ensemble(model, total_n=10000, batch_size=1024):
     curr_phi = phi_proposals[0:1]
     curr_log_q = log_q_proposals[0:1]
     curr_s = s_proposals[0:1]
+    # 【修改点 1】预分配 Tensor 存储物理构型，避免列表 append 导致显存/内存碎片化
+    ensemble = torch.empty((total_n, 1, CONFIG['L'], CONFIG['L']), dtype=phi_proposals.dtype)
 
+    # 【修改点 2】专门预分配一个布尔型 Tensor，记录每一步是否发生了跳转
+    accept_history = torch.empty(total_n, dtype=torch.bool)
+    # 第 0 步是链的起点，默认算作在当前位置 (True)
+    ensemble[0] = curr_phi.cpu()
+    accept_history[0] = True
+    accepted_count = 1
     for i in range(1, total_n):
         prop_phi = phi_proposals[i:i + 1]
         prop_log_q = log_q_proposals[i:i + 1]
@@ -66,29 +77,47 @@ def produce_ensemble(model, total_n=10000, batch_size=1024):
         # 其中 log_p = -S(phi)
         log_acc_ratio = (-prop_s - prop_log_q) - (-curr_s - curr_log_q)
 
+        # 【修改点 3】显式提取本次的接受判定结果 (True / False)
+        is_accepted = torch.log(torch.rand(1, device=device)) < log_acc_ratio
+
         # 接受判定
-        if torch.log(torch.rand(1, device=device)) < log_acc_ratio:
+        if is_accepted:
             curr_phi, curr_log_q, curr_s = prop_phi, prop_log_q, prop_s
             accepted_count += 1
 
-        # 将当前状态加入集成（无论是否发生跳转）
-        ensemble.append(curr_phi.cpu().numpy())
+        # 【修改点 4】同步将当前构型和接受状态写入预分配的内存中
+        ensemble[i] = curr_phi.cpu()
+        accept_history[i] = is_accepted.cpu().squeeze()
 
     print(f"集成生成完毕！最终接受率: {accepted_count / total_n:.2%}")
-    return np.array(ensemble)
+    return ensemble.numpy(), accept_history.numpy()
 
 
 if __name__ == "__main__":
     # 假设你的模型保存在这里
     # PATH = "best_cnn_model.pt"
     PATH = CONFIG['save_path']
+    print(PATH)
+    if CONFIG.get('double precision', False): # 开启双精度
+        torch.set_default_dtype(torch.float64)
+        print('double precision: True')
     trained_model = load_trained_model(PATH, CONFIG['L'],
                                        coupling_layers=CONFIG['coupling_layers'],
                                        hidden_channels=CONFIG['hidden_channels'],
                                         num_hidden_layers=CONFIG['hidden_layers'])
 
-    # 生成 10,000 个构型
-    final_configs = produce_ensemble(trained_model, total_n=10000)
+    # 生成 10,0000 个构型
+    final_configs, accept_traj = produce_ensemble(trained_model, total_n=1000000)
+    # 【优雅的保存方式】将物理构型和MH判定历史打包保存在同一个文件里
+    save_file = CONFIG['phi_ensemble_save_path']
+    np.savez_compressed(
+        save_file,
+        configs=final_configs,
+        accept_history=accept_traj
+    )
+    print(f"数据已打包保存至 {save_file}")
 
-    # 保存结果供后续物理分析（如计算 Green's function）
-    np.save("phi_ensemble.npy", final_configs)
+    # 后续你在做数据分析脚本时，只需要这样读取：
+    # data = np.load("phi_ensemble_with_history.npz")
+    # loaded_configs = data['configs']
+    # loaded_history = data['accept_history']

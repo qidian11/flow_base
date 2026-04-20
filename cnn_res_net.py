@@ -17,15 +17,20 @@ CONFIG = {
     'lam': 5.113,  # lambda (耦合常数)
     'batch_size': 1024,  # 批大小
     'lr': 1e-3,  # 学习率
-    'iterations': 20000,  # 训练迭代次数 [cite: 2615]
+    'iterations': 55000,  # 训练迭代次数
     'coupling_layers': 16,
-    'hidden_layers': 6, # 实际上是6*2
+    'hidden_layers': 6, # 实际上是6*3
     'hidden_channels': 16,
+    'double precision': True,
 }
-save_path = f"best_cnn_res_model_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"cnn_res_model_loss_history_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+save_path = f"best_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
+CONFIG['checkpoint_path'] = checkpoint_path
+CONFIG['phi_ensemble_save_path'] = phi_ensemble_save_path
 
 
 # ==========================================
@@ -71,10 +76,12 @@ class ResBlock(nn.Module):
         self.act1 = nn.LeakyReLU(0.01)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode='circular')
         self.act2 = nn.LeakyReLU(0.01)
+        self.conv3 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, padding_mode='circular')
+        self.act3 = nn.LeakyReLU(0.01)
 
     def forward(self, x):
         # 残差连接加在这里！只在同等维度的隐藏特征之间相加
-        return x + self.act2(self.conv2(self.act1(self.conv1(x))))
+        return x + self.act3(self.conv3(self.act2(self.conv2(self.act1(self.conv1(x))))))
 
 
 class ConvContextNet(nn.Module):
@@ -161,74 +168,139 @@ class FlowModel(nn.Module):
         # 1. 计算先验概率对数 log r(z) (独立同分布的标准正态分布)
         log_r_z = torch.sum(-0.5 * (z ** 2) - 0.5 * math.log(2 * math.pi), dim=(1, 2, 3))
 
-        # 2. 计算输出概率密度 log q(phi) = log r(z) - log|det(d_phi / d_z)| [cite: 3082, 3109]
+        # 2. 计算输出概率密度 log q(phi) = log r(z) - log|det(d_phi / d_z)|
         log_q = log_r_z - log_det_jacobian
 
         return phi, log_q
 
 
 # ==========================================
-# 5. 自训练循环 (不依赖外部数据)
+# 5. 自训练循环 (支持断点续训)
 # ==========================================
-def train(save_path, loss_save_path):
+def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path'], resume=True, checkpoint_path=CONFIG['checkpoint_path']):
     L = CONFIG['L']
-    model = FlowModel(L=L,coupling_layers=CONFIG['coupling_layers'],
+    model = FlowModel(L=L, coupling_layers=CONFIG['coupling_layers'],
                       hidden_channels=CONFIG['hidden_channels'],
                       num_hidden_layers=CONFIG['hidden_layers']).to(device)
+    if CONFIG['double precision']:
+        # 显式转换为双精度
+        model = model.double()
+
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
-    # 【新增】定义余弦退火学习率调度器
-    # T_max 是总迭代次数，eta_min 是最后降到的最小学习率
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=CONFIG['iterations'], eta_min=1e-5
-    )
+
+    # 定义余弦退火学习率调度器 (T_max 依然是配置中的总步数)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, T_max=CONFIG['iterations'], eta_min=1e-5
+    # )
+
     history_loss = []
     best_loss = float('inf')
+    start_iteration = 1
+
+    # ================= 新增：断点恢复逻辑 =================
+    if resume:
+        import os
+        old_checkpoint_path = "latest_cnn_res_model_14_coupling_layers_16_hidden_layers_6_hidden_channels_16_iterations_50000.pt"
+        old_loss_path = 'cnn_res_model_14_loss_history_coupling_layers_16_hidden_layers_6_hidden_channels_16_iterations_50000.npy'
+        if os.path.exists(old_checkpoint_path):
+            print(f"检测到断点文件，正在从 {old_checkpoint_path} 恢复训练...")
+            checkpoint = torch.load(old_checkpoint_path, map_location=device)
+
+            # 恢复模型和优化器状态
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            # ================= 强制对齐优化器内部状态的精度 =================
+            if CONFIG.get('double precision', False):
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        # 如果状态是张量，强转为双精度 (FP64)
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.double()
+
+            # 锁定在 1e-6 进行极致微调
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 1e-7  # 锁定在 1e-6 进行极致微调
+
+            # 获取上次中断的步数
+            start_iteration = checkpoint['iteration'] + 1
+
+            # load scheduler_state_dict
+            # if 'scheduler_state_dict' in checkpoint:
+            #     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # else:
+            #     # 兼容旧版本：如果没有保存 scheduler 状态，手动空跑 step 追赶进度
+            #     print("未检测到 scheduler 状态，正在同步学习率进度...")
+            #     for _ in range(start_iteration - 1):
+            #         scheduler.step()
+
+
+
+            # ================= 修改：更严谨的 Loss 恢复逻辑 =================
+            if 'history_loss' in checkpoint:
+                # 新版本：直接从断点读取严格同步的原始 Loss 记录
+                history_loss = checkpoint['history_loss']
+                print(f"成功从 checkpoint 恢复历史 Loss，当前有 {len(history_loss)} 条未平滑原始数据。")
+            elif os.path.exists(old_loss_path):
+                # 兼容老版本断点
+                history_loss = list(np.load(old_loss_path))
+                print(f"未在断点中找到 Loss，已从 npy 文件恢复历史 Loss，当前有 {len(history_loss)} 条数据。")
+            # ================================================================
+
+            print(f"恢复成功！将从第 {start_iteration} 步继续训练至 {CONFIG['iterations']} 步。")
+        else:
+            print(f"未找到断点文件 {old_checkpoint_path}，将从头开始训练。")
+    # =====================================================
 
     model.train()
     print("开始自训练...")
 
-    for iteration in range(1, CONFIG['iterations'] + 1):
+    for iteration in range(start_iteration, CONFIG['iterations'] + 1):
         optimizer.zero_grad()
 
-        # 1. 从先验分布(噪声)中纯随机采样
         z = torch.randn(CONFIG['batch_size'], 1, L, L, device=device)
-
-        # 2. 生成物理场 phi 并计算其生成的概率对数 log q(phi)
         phi, log_q = model(z)
-
-        # 3. 计算生成的场在物理理论下的 Action S(phi)
         S_phi = compute_action(phi)
-
-        # 4. 计算 KL 散度损失: Loss = mean(log q(phi) + S(phi))
         loss = torch.mean(log_q + S_phi)
 
         loss.backward()
         optimizer.step()
-        # 【新增】每次迭代后更新一次学习率
-        scheduler.step()
+        # scheduler.step()
 
         loss_val = loss.item()
         history_loss.append(loss_val)
 
-        # 打印日志
+        # 打印日志与保存
         if iteration % 100 == 0:
-            print(f"迭代 {iteration:6d}/{CONFIG['iterations']} | Loss: {loss.item():.4f}")
-            # 保存最新模型
+            current_lr = optimizer.param_groups[0]['lr']
+            # print(
+            #     f"迭代 {iteration:6d}/{CONFIG['iterations']} | Loss: {loss.item():.4f} | "
+            #     f"LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(
+                f"迭代 {iteration:6d}/{CONFIG['iterations']} | Loss: {loss.item():.4f} | "
+                f"LR: {current_lr:.2e}")
+
+            # 把 scheduler 的状态也存进去，方便下次彻底恢复
             torch.save({
                 'iteration': iteration,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                # 'scheduler_state_dict': scheduler.state_dict(),  # 新增保存 scheduler
                 'loss': loss_val,
-            }, "latest_checkpoint.pt")
+                'history_loss': history_loss,
+            }, checkpoint_path)
 
-        # 如果 Loss 创新低，保存最优模型
         if loss_val < best_loss and iteration >= 10000:
             best_loss = loss_val
             torch.save(model.state_dict(), save_path)
+
         if iteration % 1000 == 0:
             np.save(loss_save_path, np.array(history_loss))
-    print("100,000 times training finished！")
+
+    print("训练结束！")
 
 
 if __name__ == "__main__":
+    if CONFIG.get('double precision', False): # 开启双精度
+        torch.set_default_dtype(torch.float64)
     train(CONFIG['save_path'],CONFIG['loss_save_path'])

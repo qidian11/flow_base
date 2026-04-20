@@ -24,10 +24,11 @@ device = get_device(prefer="cpu")
 print(f"🔥 当前测试设备: {device}")
 
 # --- 配置 ---
-CONFIG = {
-    'L': 14,
-    'm2': -4.0,
-    'lam': 5.113,
+# 1. 配置
+CONFIG_list = [{
+    'L': 6,
+    'm2':-4,
+    'lam':6.975,
     'tao': 1.18,
     'leap_frog_step': 10,
     'save_steps': 10,
@@ -36,10 +37,83 @@ CONFIG = {
     'bin_size': 100,
     'bootstrap_time': 2000,
     'batch_size': 128,
-}
+    'ensemble_save_path': 'HMC_6_.npz',
+    'loss_save_path':'normalizing_flow_loss_6_20000}.npy'
+},{
+    'L': 8,
+    'm2':-4,
+    'lam':6.008,
+    'tao': 1.18,
+    'leap_frog_step': 10,
+    'save_steps': 10,
+    'thermal_steps': 3000,
+    'n_samples': 100000,
+    'bin_size': 100,
+    'bootstrap_time': 2000,
+    'batch_size': 128,
+    'model_save_path': 'normalizing_flow_best_model_8_30000.pt',
+    'loss_save_path':'normalizing_flow_loss_8_30000}.npy'
+},{
+    'L': 10,
+    'm2':-4,
+    'lam':5.550,
+    'tao': 1.18,
+    'leap_frog_step': 10,
+    'save_steps': 10,
+    'thermal_steps': 3000,
+    'n_samples': 100000,
+    'bin_size': 100,
+    'bootstrap_time': 2000,
+    'batch_size': 128,
+'model_save_path': 'normalizing_flow_best_model_10_50000.pt',
+    'loss_save_path':'normalizing_flow_loss_10_50000}.npy'
+},{
+    'L': 12,
+    'm2':-4,
+    'lam':5.276,
+    'tao': 1.18,
+    'leap_frog_step': 10,
+    'save_steps': 10,
+    'thermal_steps': 3000,
+    'n_samples': 100000,
+    'bin_size': 100,
+    'bootstrap_time': 2000,
+    'batch_size': 128,
+'model_save_path': 'normalizing_flow_best_model_12_80000.pt',
+    'loss_save_path':'normalizing_flow_loss_12_80000}.npy'
+},{
+    'L': 14,
+    'm2':-4,
+    'lam':5.113,
+    'tao': 1.18,
+    'leap_frog_step': 10,
+    'save_steps': 10,
+    'thermal_steps': 3000,
+    'n_samples': 100000,
+    'bin_size': 100,
+    'bootstrap_time': 2000,
+    'batch_size': 128,
+    'model_save_path': 'normalizing_flow_best_model_14_100000.pt',
+    'loss_save_path':'normalizing_flow_loss_14_100000}.npy'
+},]
+
+# CONFIG = {
+#     'L': 14,
+#     'm2': -4.0,
+#     'lam': 5.113,
+#     'tao': 1.18,
+#     'leap_frog_step': 10,
+#     'save_steps': 10,
+#     'thermal_steps': 3000,
+#     'n_samples': 100000,
+#     'bin_size': 100,
+#     'bootstrap_time': 2000,
+#     'batch_size': 128,
+# }
 
 DTYPE = torch.float64
 
+CONFIG = CONFIG_list[0]
 
 def calculate_action(phi):
     # phi shape: [batchsize, L, L]
@@ -508,12 +582,12 @@ def main():
         y_err_m = e_m_error_bar.numpy()
         # 1. 设置画布
         # 两个图都是 1.4:1 的宽图，并排显示，建议把画布宽度设大一点，比如 (10, 4) 或 (12, 5)
-        fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+        fig, axs = plt.subplots(1, 2, figsize=(12, 5))
 
         # --- 左图：Green Function G(t) ---
 
         # 设置宽高比 W:H = 1.4:1 -> H/W = 1/1.4
-        axs[0].set_box_aspect(1 / 1.6875)
+        axs[0].set_box_aspect(1 / 1.4)
 
         axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
         axs[0].errorbar(
@@ -537,7 +611,7 @@ def main():
         # --- 右图：Effective Mass ---
 
         # 设置宽高比 W:H = 1.4:1
-        axs[1].set_box_aspect(1 / 1.6875)
+        axs[1].set_box_aspect(1 / 1.4)
 
         axs[1].xaxis.set_major_locator(MaxNLocator(integer=True))
         axs[1].errorbar(
