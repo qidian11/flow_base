@@ -3,10 +3,39 @@ import torch.nn as nn
 import torch.optim as optim
 import math
 import numpy as np
+import os
+import glob
+
+
 
 device = torch.device(
     "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
 print(f"运行设备: {device}")
+
+
+def auto_find_latest_checkpoint(config):
+    """
+    自动搜索当前目录下，架构匹配的最新断点文件。
+    使用 '*' 忽略 double_precision 和 iterations 的差异。
+    """
+    # 构建通配符搜索模式
+    search_pattern = (
+        f"latest_cnn_res_block_mask_model_double_precision_*_"
+        f"{config['L']}_coupling_layers_{config['coupling_layers']}_"
+        f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
+        f"iterations_*.pt"
+    )
+
+    # 搜索所有匹配的文件
+    matched_files = glob.glob(search_pattern)
+
+    if not matched_files:
+        return None
+
+    # 根据文件的系统最后修改时间，筛选出最新保存的那个
+    latest_file = max(matched_files, key=os.path.getmtime)
+    return latest_file
+
 
 # ==========================================
 # 1. 物理参数配置
@@ -17,11 +46,11 @@ CONFIG = {
     'lam': 5.113,  # lambda (耦合常数)
     'batch_size': 1024,  # 批大小
     'lr': 1e-3,  # 学习率
-    'iterations': 55000,  # 训练迭代次数
+    'iterations': 15000,  # 训练迭代次数
     'coupling_layers': 16,
     'hidden_layers': 6, # 实际上是6*3
     'hidden_channels': 16,
-    'double precision': True,
+    'double precision': False,
 }
 save_path = f"best_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
 loss_save_path = f"cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
@@ -189,9 +218,9 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
 
     # 定义余弦退火学习率调度器 (T_max 依然是配置中的总步数)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer, T_max=CONFIG['iterations'], eta_min=1e-5
-    # )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=CONFIG['iterations'], eta_min=1e-5
+    )
 
     history_loss = []
     best_loss = float('inf')
@@ -199,9 +228,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
 
     # ================= 新增：断点恢复逻辑 =================
     if resume:
-        import os
-        old_checkpoint_path = "latest_cnn_res_model_14_coupling_layers_16_hidden_layers_6_hidden_channels_16_iterations_50000.pt"
-        old_loss_path = 'cnn_res_model_14_loss_history_coupling_layers_16_hidden_layers_6_hidden_channels_16_iterations_50000.npy'
+        old_checkpoint_path = auto_find_latest_checkpoint(CONFIG)
         if os.path.exists(old_checkpoint_path):
             print(f"检测到断点文件，正在从 {old_checkpoint_path} 恢复训练...")
             checkpoint = torch.load(old_checkpoint_path, map_location=device)
@@ -241,10 +268,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
                 # 新版本：直接从断点读取严格同步的原始 Loss 记录
                 history_loss = checkpoint['history_loss']
                 print(f"成功从 checkpoint 恢复历史 Loss，当前有 {len(history_loss)} 条未平滑原始数据。")
-            elif os.path.exists(old_loss_path):
-                # 兼容老版本断点
-                history_loss = list(np.load(old_loss_path))
-                print(f"未在断点中找到 Loss，已从 npy 文件恢复历史 Loss，当前有 {len(history_loss)} 条数据。")
+
             # ================================================================
 
             print(f"恢复成功！将从第 {start_iteration} 步继续训练至 {CONFIG['iterations']} 步。")
@@ -265,7 +289,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
 
         loss.backward()
         optimizer.step()
-        # scheduler.step()
+        scheduler.step()
 
         loss_val = loss.item()
         history_loss.append(loss_val)

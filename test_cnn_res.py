@@ -85,6 +85,9 @@ def produce_ensemble(model, total_n=100000, batch_size=1024):
             curr_phi, curr_log_q, curr_s = prop_phi, prop_log_q, prop_s
             accepted_count += 1
 
+        if i % 100 == 0:
+            print(f'step:{i},accept ratio:{accepted_count/i:.2%}')
+
         # 【修改点 4】同步将当前构型和接受状态写入预分配的内存中
         ensemble[i] = curr_phi.cpu()
         accept_history[i] = is_accepted.cpu().squeeze()
@@ -107,7 +110,7 @@ if __name__ == "__main__":
                                         num_hidden_layers=CONFIG['hidden_layers'])
 
     # 生成 10,0000 个构型
-    final_configs, accept_traj = produce_ensemble(trained_model, total_n=1000000)
+    final_configs, accept_traj = produce_ensemble(trained_model, total_n=100000)
     # 【优雅的保存方式】将物理构型和MH判定历史打包保存在同一个文件里
     save_file = CONFIG['phi_ensemble_save_path']
     np.savez_compressed(
