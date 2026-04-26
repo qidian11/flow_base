@@ -113,7 +113,7 @@ We tested splitting the lattice into 2, 4, and 8 blocks. A higher number of bloc
 ### 4.2. $14 \times 14$ Lattice: Overall Performance Gain
 ![14x14 pre-processing vs none-preprocessing loss history](14x14%20pre-processing%20vs%20none-preprocessing%20loss%20history.png)
 
-Scaling the lattice up to $14 \times 14$ confirms the scalability of the method. Model 1 (with Free-Field Pre-sampling) achieves a strictly lower loss bound and lower variance compared to Model 2 (Standard Gaussian). This directly reflects the analytical KL-divergence cancellation derived in Section 2.4.
+Scaling the lattice up to $14 \times 14$ confirms the scalability of the method. Model 1 (with Free-Field Pre-sampling) achieves a strictly lower loss bound and lower variance compared to Model 2 (Standard Gaussian).
 
 ### 4.3. Metropolis-Hastings Acceptance Rate Evaluation
 
