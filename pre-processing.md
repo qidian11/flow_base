@@ -135,8 +135,7 @@ After 15,000 training steps (evaluated in single precision), the acceptance rate
 
 ![](HMC%20vs%20pre-sampling.png)
 
-**Analysis:**
-The Free-Field Pre-sampling model achieves nearly 10% in the MH acceptance rate over the standard baseline. This boost provides concrete evidence that injecting physical spatial correlations (the kinetic term) into the base distribution allows the network to generate configurations that are structurally much closer to the true physical equilibrium states. As a result, the rejection rate during the Markov Chain Monte Carlo sampling phase is drastically reduced, leading to higher overall sampling efficiency.
+
 ---
 
 ## 5. Conclusion
