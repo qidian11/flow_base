@@ -146,7 +146,7 @@ if __name__ == "__main__":
         prior = prior.double()
 
     # 生成物理集成 (例如 100,000 个构型)
-    final_configs, accept_traj = produce_ensemble(trained_model, prior, total_n=40000)
+    final_configs, accept_traj = produce_ensemble(trained_model, prior, total_n=100000)
 
     # 打包保存
     save_file = CONFIG['phi_ensemble_save_path']

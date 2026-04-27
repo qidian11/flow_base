@@ -124,6 +124,17 @@ After 15,000 training steps (evaluated in single precision), the acceptance rate
 * **Model 1 (Free-Field Pre-sampling):** 49.23%
 * **Model 2 (Standard Normal Base / CNN ResNet):** 39.80%
 
+### 4.4 observables
+| Observable | HMC (Base) | Prior CNN (Flow) |
+| :--- | :--- | :--- |
+| $\phi^1$ | -0.000551 ± 0.001402 | 0.002416 ± 0.000979 |
+| $\phi^2$ | 0.218334 ± 0.000181 | 0.218669 ± 0.000120 |
+| $\phi^3$ | -0.000166 ± 0.000556 | 0.000965 ± 0.000396 |
+| $\phi^4$ | 0.090626 ± 0.000120 | 0.090876 ± 0.000084 |
+| $\phi^5$ | -0.000056 ± 0.000293 | 0.000512 ± 0.000212 |
+
+![](HMC%20vs%20pre-sampling.png)
+
 **Analysis:**
 The Free-Field Pre-sampling model achieves nearly 10% in the MH acceptance rate over the standard baseline. This boost provides concrete evidence that injecting physical spatial correlations (the kinetic term) into the base distribution allows the network to generate configurations that are structurally much closer to the true physical equilibrium states. As a result, the rejection rate during the Markov Chain Monte Carlo sampling phase is drastically reduced, leading to higher overall sampling efficiency.
 ---

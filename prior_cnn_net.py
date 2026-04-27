@@ -80,34 +80,35 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 # 1. 物理参数配置
 # ==========================================
+CONFIG = {
+    'Type': 'Prior_CNN',
+    'L': 14,  # 晶格大小 (对应实验 E5)
+    'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
+    'lam': 5.113,  # lambda (耦合常数)
+    'batch_size': 2048,  # 批大小
+    'lr': 1e-6,  # 学习率
+    'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
+    'iterations': 45000,  # 训练迭代次数
+    'coupling_layers': 32,
+    'kernel_size': 3,
+    'hidden_layers': 6,  # 实际上是6*3
+    'hidden_channels': 16,
+    'double precision': True,
+}
 # CONFIG = {
 #     'L': 14,  # 晶格大小 (对应实验 E5)
 #     'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
 #     'lam': 5.113,  # lambda (耦合常数)
-#     'batch_size': 2048,  # 批大小
-#     'lr': 1e-6,  # 学习率
+#     'batch_size': 1024,  # 批大小
+#     'lr': 1e-5,  # 学习率
 #     'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
-#     'iterations': 45000,  # 训练迭代次数
-#     'coupling_layers': 32,
-#     'kernel_size': 3,
+#     'iterations': 25000,  # 训练迭代次数
+#     'coupling_layers': 14,
+#     'kernel_size': 6,
 #     'hidden_layers': 6,  # 实际上是6*3
 #     'hidden_channels': 16,
-#     'double precision': True,
+#     'double precision': False,
 # }
-CONFIG = {
-    'L': 14,  # 晶格大小 (对应实验 E5)
-    'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
-    'lam': 5.113,  # lambda (耦合常数)
-    'batch_size': 1024,  # 批大小
-    'lr': 1e-5,  # 学习率
-    'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
-    'iterations': 25000,  # 训练迭代次数
-    'coupling_layers': 14,
-    'kernel_size': 6,
-    'hidden_layers': 6,  # 实际上是6*3
-    'hidden_channels': 16,
-    'double precision': False,
-}
 save_path = f"best_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
 loss_save_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
 checkpoint_path = f"latest_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"

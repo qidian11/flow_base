@@ -22,14 +22,16 @@ def get_device(prefer="auto"):
 
 device = get_device(prefer="cpu")
 print(f"🔥 当前测试设备: {device}")
+DTYPE = torch.float64
 
 # --- 配置 ---
 # 1. 配置
-CONFIG_list = [{
+CONFIG = [
+    {
     'L': 6,
     'm2':-4,
     'lam':6.975,
-    'tao': 1.18,
+    'tao': 1.62,
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 3000,
@@ -39,11 +41,12 @@ CONFIG_list = [{
     'batch_size': 128,
     'ensemble_save_path': 'HMC_6_.npz',
     'loss_save_path':'normalizing_flow_loss_6_20000}.npy'
-},{
+},
+    {
     'L': 8,
     'm2':-4,
     'lam':6.008,
-    'tao': 1.18,
+    'tao': 1.5,
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 3000,
@@ -53,11 +56,12 @@ CONFIG_list = [{
     'batch_size': 128,
     'model_save_path': 'normalizing_flow_best_model_8_30000.pt',
     'loss_save_path':'normalizing_flow_loss_8_30000}.npy'
-},{
+},
+    {
     'L': 10,
     'm2':-4,
     'lam':5.550,
-    'tao': 1.18,
+    'tao': 1.39,
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 3000,
@@ -67,11 +71,12 @@ CONFIG_list = [{
     'batch_size': 128,
 'model_save_path': 'normalizing_flow_best_model_10_50000.pt',
     'loss_save_path':'normalizing_flow_loss_10_50000}.npy'
-},{
+},
+    {
     'L': 12,
     'm2':-4,
     'lam':5.276,
-    'tao': 1.18,
+    'tao': 1.28,
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 3000,
@@ -82,6 +87,7 @@ CONFIG_list = [{
 'model_save_path': 'normalizing_flow_best_model_12_80000.pt',
     'loss_save_path':'normalizing_flow_loss_12_80000}.npy'
 },{
+    'Type': 'HMC',
     'L': 14,
     'm2':-4,
     'lam':5.113,
@@ -93,9 +99,18 @@ CONFIG_list = [{
     'bin_size': 100,
     'bootstrap_time': 2000,
     'batch_size': 128,
+    'double precision': True,
     'model_save_path': 'normalizing_flow_best_model_14_100000.pt',
-    'loss_save_path':'normalizing_flow_loss_14_100000}.npy'
+    'loss_save_path':'normalizing_flow_loss_14_100000}.npy',
+    'phi_ensemble_save_path': ''
 },]
+
+save_samples = CONFIG[-1]['batch_size'] * CONFIG[-1]['n_samples'] / CONFIG[-1]['save_steps']
+save_samples = int(save_samples)
+dtype_str = "double" if DTYPE == torch.float64 else "single"
+phi_ensemble_save_path = f"HMC_configs_L{CONFIG[-1]['L']}_N{save_samples}_DTYPE_{dtype_str}.npz"
+
+CONFIG[-1]['phi_ensemble_save_path'] = phi_ensemble_save_path
 
 # CONFIG = {
 #     'L': 14,
@@ -111,11 +126,11 @@ CONFIG_list = [{
 #     'batch_size': 128,
 # }
 
-DTYPE = torch.float64
 
-CONFIG = CONFIG_list[0]
 
-def calculate_action(phi):
+
+
+def calculate_action(phi, config):
     # phi shape: [batchsize, L, L]
     phi_up = torch.roll(phi, shifts=-1, dims=1)
     phi_down = torch.roll(phi, shifts=1, dims=1)
@@ -124,7 +139,7 @@ def calculate_action(phi):
 
     # 动能项 (离散拉普拉斯算子部分)
     kinetic_term = 4 * phi * phi - phi * (phi_right + phi_left + phi_up + phi_down)
-    potential_term = CONFIG['m2'] * phi * phi + CONFIG['lam'] * phi ** 4
+    potential_term = config['m2'] * phi * phi + config['lam'] * phi ** 4
 
     # 对整个 grid 求和，得到标量 Action
     action = (kinetic_term + potential_term).sum(dim=(1, 2))
@@ -136,13 +151,13 @@ def calculate_kinetic_energy(p):
     return 0.5 * torch.sum(p ** 2, dim=(1, 2))
 
 
-def calculate_hamiltonian(phi, p):
-    action = calculate_action(phi)
+def calculate_hamiltonian(phi, p,config):
+    action = calculate_action(phi,config)
     kinetic_energy = calculate_kinetic_energy(p)
     return kinetic_energy + action
 
 
-def get_force(phi):
+def get_force(phi, config):
     # phi shape: [L, L]
     phi_up = torch.roll(phi, shifts=-1, dims=1)
     phi_down = torch.roll(phi, shifts=1, dims=1)
@@ -151,24 +166,24 @@ def get_force(phi):
 
     # 导数计算
     return -(8 * phi - 2 * (phi_up + phi_down + phi_right + phi_left)
-             + 2 * CONFIG['m2'] * phi + 4 * CONFIG['lam'] * phi ** 3)
+             + 2 * config['m2'] * phi + 4 * config['lam'] * phi ** 3)
 
 
 def get_velocity(p):
     return p
 
 
-def leap_frog(phi, p, tao):
-    epsilon = tao / CONFIG['leap_frog_step']
+def leap_frog(phi, p, tao, config):
+    epsilon = tao / config['leap_frog_step']
 
     # Half step for momentum
-    force = get_force(phi)
+    force = get_force(phi,config)
     p_new = p + (epsilon / 2) * force
 
     phi_new = phi.clone()
 
     # Full steps
-    for i in range(CONFIG['leap_frog_step']):
+    for i in range(config['leap_frog_step']):
         phi_new = phi_new + epsilon * get_velocity(p_new)
 
         # NaN 检查
@@ -176,11 +191,11 @@ def leap_frog(phi, p, tao):
             print("NaN detected in leap frog")
             return phi_new, p_new
 
-        if i != CONFIG['leap_frog_step'] - 1:
-            p_new = p_new + epsilon * get_force(phi_new)
+        if i != config['leap_frog_step'] - 1:
+            p_new = p_new + epsilon * get_force(phi_new, config)
 
     # Final half step for momentum
-    p_new = p_new + (epsilon / 2) * get_force(phi_new)
+    p_new = p_new + (epsilon / 2) * get_force(phi_new, config)
 
     if torch.isnan(phi_new).any():
         print("NaN detected in leap frog")
@@ -190,21 +205,21 @@ def leap_frog(phi, p, tao):
 def HMC_step(phi, tao):
     # 1. 为每条链独立生成动量
     p = torch.randn_like(phi)
-    h_old = calculate_hamiltonian(phi, p)
+    h_old = calculate_hamiltonian(phi, p,config)
 
     # 2. Leapfrog 演化
-    phi_new, p_new = leap_frog(phi, p, tao)
+    phi_new, p_new = leap_frog(phi, p, tao, config)
 
     # 3. 计算反向演化（用于可逆性检查 delta_phi, delta_p）
-    phi_inv, p_inv = leap_frog(phi_new, -p_new, tao)
+    phi_inv, p_inv = leap_frog(phi_new, -p_new, tao, config)
     delta_phi = phi - phi_inv  # [Batch, L, L]
     delta_p = p + p_inv  # [Batch, L, L]
 
-    h_inv = calculate_hamiltonian(phi_inv, p_inv)
+    h_inv = calculate_hamiltonian(phi_inv, p_inv,config)
     delta_inverse_H = h_inv - h_old  # [Batch]
 
     # 4. 判定接受
-    h_new = calculate_hamiltonian(phi_new, p_new)
+    h_new = calculate_hamiltonian(phi_new, p_new,config)
     delta_H = h_new - h_old  # [Batch]
 
     # --- NaN/Inf 检查 ---
@@ -227,12 +242,12 @@ def HMC_step(phi, tao):
     return phi_next, delta_H, delta_inverse_H, delta_phi, delta_p, True, avg_accept
 
 
-def calculate_G_t_list_inside_bin(binning_ensemble):
+def calculate_G_t_list_inside_bin(binning_ensemble, config):
     G_t_list = []
 
-    for t in range(CONFIG['L']):
+    for t in range(config['L']):
         G_t_l_list = []
-        for l in range(CONFIG['L']):
+        for l in range(config['L']):
             # conn = get_connected_2_point_correlation(ensemble, t, l)
             conn_2_point = get_correlation_for_single_configuration(binning_ensemble, t, l)
             expected_phi = get_expected_phi(binning_ensemble)
@@ -287,10 +302,10 @@ def get_effective_mass(G_t):
     return m_eff
 
 
-def binning(data):
-    N_bin = data.shape[0] // CONFIG['bin_size']
-    data = data[:N_bin * CONFIG['bin_size']]
-    data = data.view(N_bin, CONFIG['bin_size'], *data.shape[1:])
+def binning(data, config):
+    N_bin = data.shape[0] // config['bin_size']
+    data = data[:N_bin * config['bin_size']]
+    data = data.view(N_bin, config['bin_size'], *data.shape[1:])
     return data
 
 
@@ -307,11 +322,11 @@ def bootstrap(data, bootsrtrap_time):
     return torch.stack(lst)
 
 
-def main():
-    print(f"Config: L={CONFIG['L']}, Tao={CONFIG['tao']} (Batch/Channel dims={CONFIG['batch_size']})")
+def main(config):
+    print(f"Config: L={config['L']}, Tao={config['tao']} (Batch/Channel dims={config['batch_size']})")
 
     # 初始化：直接生成 [batchsize, L, L]
-    phi = torch.zeros(CONFIG['batch_size'], CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
+    phi = torch.zeros(config['batch_size'], config['L'], config['L'], dtype=DTYPE, device=device)
     delta_H_list = []
     delta_inverse_hamiltonian_list = []
     delta_phi_list = []
@@ -319,18 +334,18 @@ def main():
     # 预热 (Thermalization)
     print("Start Thermalization...")
     step = 0
-    while step < CONFIG['thermal_steps']:
-        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, CONFIG['tao'])
+    while step < config['thermal_steps']:
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, config['tao'])
 
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
             if step == 0:
-                phi = torch.zeros(CONFIG['batch_size'], CONFIG['L'], CONFIG['L'], dtype=DTYPE, device=device)
+                phi = torch.zeros(config['batch_size'], config['L'], config['L'], dtype=DTYPE, device=device)
             continue
 
         step += 1
         if step % 1000 == 0:
-            print(f"Thermal Step {step}/{CONFIG['thermal_steps']}")
+            print(f"Thermal Step {step}/{config['thermal_steps']}")
 
     # 采样 (Sampling)
     print("Start Sampling...")
@@ -339,8 +354,8 @@ def main():
     accept_count = 0
     acc_list = []
 
-    while step < CONFIG['n_samples']:
-        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, CONFIG['tao'])
+    while step < config['n_samples']:
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, config['tao'])
 
         if not success:
             print(f"Sample Step {step}: NaN detected! Retrying...")
@@ -348,7 +363,7 @@ def main():
 
         accept_count += avg_acc  # 累加平均接受率
         acc_list.append(avg_acc)
-        if step % CONFIG['save_steps'] == 0:
+        if step % config['save_steps'] == 0:
             # detach 并存入列表
             ensemble.append(phi.clone().detach().cpu())
             delta_H_list.append(delta_H.detach().cpu())
@@ -358,7 +373,7 @@ def main():
 
         step += 1
         if step % 1000 == 0:
-            print(f"Sampling Step {step}/{CONFIG['n_samples']}, Accept Ratio: {accept_count / step * 100:.2f}%")
+            print(f"Sampling Step {step}/{config['n_samples']}, Accept Ratio: {accept_count / step * 100:.2f}%")
 
     # 处理数据
     # ensemble_tensor shape: [Samples, batchsize, L, L]
@@ -372,273 +387,284 @@ def main():
     print(f"单次波动 (Std Dev): {acc_std:.5f}")
     print(f"平均值误差 (Std Err): {acc_error:.5f}")
 
-    L = CONFIG['L']
+    L = config['L']
     ensemble_tensor = ensemble_tensor.transpose(0, 1).reshape(-1, L, L)
     print(f"Ensemble shape: {ensemble_tensor.shape}")
 
-    # --- 新增功能：保存所有展平后的构型 ---
-    print("Saving flattened configurations...")
-    # Reshape to [Total_Samples, L*L]
-    flattened_ensemble = ensemble_tensor.reshape(-1, L * L).cpu().numpy()
-    # 2. 切片：每隔 100 个取 1 个 ([::100])
-    saved_ensemble = flattened_ensemble[::100]
-    # 3. 保存
-    save_filename = f"configs_L{L}_N{saved_ensemble.shape[0]}.npy"
-    np.save(save_filename, saved_ensemble)
-    print(f"✅ 已保存稀疏化构型到: {save_filename}")
-    print(f"   Original Shape: {flattened_ensemble.shape} -> Saved Shape: {saved_ensemble.shape}")
+    # --- 新增功能：保存所有构型 与cnn保存格式一致---
+    # --- 统一保存格式，与 test_prior_cnn.py 对齐 ---
+    print("Saving configurations in standard format [N, 1, L, L]...")
+
+    # 当前 ensemble_tensor 已经是 [-1, L, L]
+    # 增加一个维度变成 [-1, 1, L, L] 以匹配 CNN/流模型的通道维度
+    standard_ensemble = ensemble_tensor.unsqueeze(1).cpu().numpy()
+
+    # 同样做稀疏化，每隔 100 步取 1 个
+    saved_ensemble = standard_ensemble[::100]
+
+    # 保存为 .npz，且键名设为 'configs'
+    dtype_str = "double" if DTYPE == torch.float64 else "single"
+    save_filename = f"HMC_configs_L{L}_N{standard_ensemble.shape[0]}_DTYPE_{dtype_str}.npz"
+    np.savez_compressed(
+        save_filename,
+        configs=saved_ensemble,
+        accept_history=np.array(acc_list)  # 这里把接受率存进去
+    )
+    print(f"✅ 已保存标准化构型到: {save_filename}")
+    print(f"   Saved Shape: {saved_ensemble.shape}")
     # -----------------------------------
 
-    delta_inverse_hamiltonian_tensor = torch.stack(delta_inverse_hamiltonian_list)
-    delta_inverse_hamiltonian_tensor = delta_inverse_hamiltonian_tensor.transpose(0, 1).reshape(-1)
-
-    delta_H_tensor = torch.stack(delta_H_list, dim=0)
-    delta_H_tensor = delta_H_tensor.transpose(0, 1).reshape(-1)
-
-    delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
-    delta_phi_list_tensor = delta_phi_list_tensor.transpose(0, 1).reshape(-1, L, L)
-
-    delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
-    delta_p_list_tensor = delta_p_list_tensor.transpose(0, 1).reshape(-1, L, L)
-
-    # shape:[N_bin, bin_size]
-    binning_delta_H_tensor = binning(delta_H_tensor)
-    # mean in bin
-    binning_delta_H_tensor = binning_delta_H_tensor.mean(dim=1)
-    bootstrap_delta_H_tensor = bootstrap(binning_delta_H_tensor, CONFIG['bootstrap_time'])
-    delta_H_error = bootstrap_delta_H_tensor.std(dim=0)
-    print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
-    print(f"{torch.mean(binning_delta_H_tensor):.5f}({int(delta_H_error * 1e5):02d})")
-    delta_H_exp_tensor = torch.exp(-delta_H_tensor)
-    binning_delta_H_exp_tensor = binning(delta_H_exp_tensor)
-    binning_delta_H_exp_tensor = binning_delta_H_exp_tensor.mean(dim=0)
-    bootstrap_delta_H_exp_tensor = bootstrap(binning_delta_H_exp_tensor, CONFIG['bootstrap_time'])
-    delta_H_exp_error = bootstrap_delta_H_exp_tensor.std(dim=0)
-
-    print(f'expect of delta_H_exp:{torch.mean(binning_delta_H_exp_tensor).item():.2e}')
-    print(f'{torch.mean(binning_delta_H_exp_tensor):.2e}({int(delta_H_exp_error * 1e5):02d})')
-    print(f'delta_H_exp_error:{delta_H_exp_error:.2e}')
-
-    # print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
-    # print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
-    # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
-    # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
-    y = np.array([x.item() for x in delta_inverse_hamiltonian_tensor.cpu().numpy()])
-    x = torch.arange(len(y))
-
-    plt.figure()
-    plt.plot(x, y)
-    plt.xlabel("index")
-    plt.ylabel("delta hamiltonian")
-    plt.show()
-
-    # delta_phi
-    y = np.array([x.item() for x in delta_phi_list_tensor.mean(dim=(1, 2)).cpu().numpy()])
-    x = torch.arange(len(y))
-
-    plt.figure()
-    plt.plot(x, y)
-    plt.xlabel("index")
-    plt.ylabel("delta phi")
-    plt.show()
-
-    # delta_p
-    y = np.array([x.item() for x in delta_p_list_tensor.mean(dim=(1, 2)).cpu().numpy()])
-    x = torch.arange(len(y))
-
-    plt.figure()
-    plt.plot(x, y)
-    plt.xlabel("index")
-    plt.ylabel("delta p")
-    plt.show()
-
-    # shape=(N_bin, bin_size, time, space)
-    binning_ensemble = binning(ensemble_tensor)
-    phi_to_1 = binning_ensemble.mean()
-    bootstrap_phi_to_1 = bootstrap(binning_ensemble.mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1, 2))
-    print(f"bootstrap_phi_to_1 shape: {bootstrap_phi_to_1.shape}")
-    phi_to_1_error = bootstrap_phi_to_1.std(dim=0)
-    print(f"phi_to_1_error shape: {phi_to_1_error.shape}")
-    phi_to_2 = (binning_ensemble * binning_ensemble).mean()
-    bootstrap_phi_to_2 = bootstrap((binning_ensemble ** 2).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1, 2))
-    phi_to_2_error = bootstrap_phi_to_2.std(dim=0)
-    phi_to_3 = (binning_ensemble ** 3).mean()
-    bootstrap_phi_to_3 = bootstrap((binning_ensemble ** 3).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1, 2))
-    phi_to_3_error = bootstrap_phi_to_3.std(dim=0)
-    phi_to_4 = (binning_ensemble ** 4).mean()
-    bootstrap_phi_to_4 = bootstrap((binning_ensemble ** 4).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1, 2))
-    phi_to_4_error = bootstrap_phi_to_4.std(dim=0)
-    phi_to_5 = (binning_ensemble ** 5).mean()
-    bootstrap_phi_to_5 = bootstrap((binning_ensemble ** 5).mean(dim=1), CONFIG['bootstrap_time']).mean(dim=(1, 2))
-    phi_to_5_error = bootstrap_phi_to_5.std(dim=0)
-    print("delta_H: {:.2e}".format(delta_H_tensor.mean().item()))
-    print("expectation of exp delta_h: {:.2e}".format(torch.exp(-delta_H_tensor).mean().item()))
-    print(f"phi_to_1:{phi_to_1:.2e}")
-    print(f"{phi_to_1:.6f}({phi_to_1_error:.6f})")
-    print(f"phi_to_2:{phi_to_2:.2e}")
-    print(f"{phi_to_2:.6f}({phi_to_2_error:.6f})")
-    print(f"phi_to_3:{phi_to_3:.2e}")
-    print(f"{phi_to_3:.6f}({phi_to_3_error:.6f})")
-    print(f"phi_to_4:{phi_to_4:.2e}")
-    print(f"{phi_to_4:.6f}({phi_to_4_error:.6f})")
-    print(f"phi_to_5:{phi_to_5:.2e}")
-    print(f"{phi_to_5:.6f}({phi_to_5_error:.6f})")
-    try:
-        # --- 修改开始：修正 Bootstrap G(t) 的逻辑 ---
-
-        # 1. 预计算每个 Bin 的基础统计量
-        print("Pre-calculating bins for correct Bootstrap...")
-
-        # Part A: 计算 Term 1 (Unconnected Two-point per bin)
-        # G_unc_bin: [N_bin, T]
-        G_unc_list = []
-        for t in range(CONFIG['L']):
-            corr_t_l_list = []
-            for l in range(CONFIG['L']):
-                # get_correlation 返回 [N_bin, bin_size]
-                c = get_correlation_for_single_configuration(binning_ensemble, t, l)
-                # 对 bin_size 求平均 -> [N_bin]
-                corr_t_l_list.append(c.mean(dim=1))
-
-                # 对空间体积 (loop l) 求平均 -> [N_bin]
-            corr_t = torch.stack(corr_t_l_list, dim=1).mean(dim=1)
-            G_unc_list.append(corr_t)
-
-        G_unc_bin = torch.stack(G_unc_list, dim=1)  # [N_bin, T]
-        print(f"G_unc_bin shape: {G_unc_bin.shape}")
-
-        # Part B: 计算 Term 2 的两个部分 (Explicitly shifted)
-        # 1. Origin Magnetization: <phi(x)>_bin
-        # binning_ensemble: [N_bin, bin_size, L, L] -> [N_bin]
-        mag_bin_origin = binning_ensemble.mean(dim=(1, 2, 3))
-
-        # 2. Shifted Magnetization: <phi(x+t)>_bin
-        # 我们必须为每一个时间 t 显式计算平移后的磁化强度
-        # 虽然在 PBC 下它数值上等于 origin，但为了符合物理含义显式计算
-        mag_bin_shifted_list = []
-        for t in range(CONFIG['L']):
-            # 在时间维度 (dim=2) 上平移
-            shifted_ensemble = torch.roll(binning_ensemble, shifts=t, dims=2)
-            # 计算平移后的 bin 均值 -> [N_bin]
-            mag_t = shifted_ensemble.mean(dim=(1, 2, 3))
-            mag_bin_shifted_list.append(mag_t)
-
-        # mag_bin_shifted: [N_bin, T]
-        mag_bin_shifted = torch.stack(mag_bin_shifted_list, dim=1)
-
-        # 2. 正确的 Bootstrap 循环 (对索引重采样)
-        print("Running correct Bootstrap loop (Explicit Shift)...")
-        G_t_boot_list = []
-        N_bin = binning_ensemble.shape[0]
-
-        for i in range(CONFIG['bootstrap_time']):
-            # 生成随机索引 (与数据在同一设备上)
-            idx = torch.randint(0, N_bin, (N_bin,), device=binning_ensemble.device)
-
-            # 提取当前样本的统计量
-            # 第一项：<phi(0)phi(t)> 的全局均值
-            G_unc_star = G_unc_bin[idx].mean(dim=0)  # [T]
-
-            # 第二项：显式计算 <phi(0)> * <phi(t)>
-            # <phi(0)>
-            mag_origin_star = mag_bin_origin[idx].mean()  # Scalar
-            # <phi(t)> (这是一个向量，对应每个 t)
-            mag_shifted_star = mag_bin_shifted[idx].mean(dim=0)  # [T]
-
-            # 组合计算 Connected Correlator
-            # Explicitly: <OO> - <O_origin> * <O_shifted>
-            G_conn_star = G_unc_star - mag_origin_star * mag_shifted_star
-
-            G_t_boot_list.append(G_conn_star)
-
-        # 得到 G(t) 的分布
-        bootstrap_ensemble_tensor = torch.stack(G_t_boot_list)  # [Boot, T]
-        print(f"bootstrap_tensor's shape:{bootstrap_ensemble_tensor.shape}")
-
-        # 3. 统计结果
-        G_error_bar = bootstrap_ensemble_tensor.std(dim=0)
-        y_err_g = G_error_bar.numpy()
-
-        # G_t 的中心值取 Bootstrap 分布的均值
-        G_t = bootstrap_ensemble_tensor.mean(dim=0)
-
-        # --- 修改结束 ---
-
-        print("G_t values:")
-        for t_val in G_t:
-            print(f"{t_val.item():.16E}")
-
-        print("y_err_g:")
-        for t_val in y_err_g:
-            print(f"{t_val.item():.16E}")
-
-        # effective mass
-        # shape=(time)
-        effective_mass = get_effective_mass(G_t)
-        effective_mass = effective_mass[1:-1]
-        bootstrap_effective_mass = get_effective_mass(bootstrap_ensemble_tensor)
-        bootstrap_effective_mass = bootstrap_effective_mass[:, 1:-1]
-        e_m_error_bar = bootstrap_effective_mass.std(dim=0)
-        y_err_m = e_m_error_bar.numpy()
-        # 1. 设置画布
-        # 两个图都是 1.4:1 的宽图，并排显示，建议把画布宽度设大一点，比如 (10, 4) 或 (12, 5)
-        fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-
-        # --- 左图：Green Function G(t) ---
-
-        # 设置宽高比 W:H = 1.4:1 -> H/W = 1/1.4
-        axs[0].set_box_aspect(1 / 1.4)
-
-        axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
-        axs[0].errorbar(
-            np.arange(len(G_t.numpy())),
-            G_t.numpy(),
-            yerr=y_err_g,
-            fmt='-o',  # 格式: '-'连线, 'o'点
-            color='blue',  # 数据颜色
-            ecolor='purple',  # 误差棒颜色
-            capsize=4,  # 误差棒帽子宽度
-            elinewidth=1.5,  # 误差棒线宽
-            label='Lattice Data'
-        )
-        axs[0].set_yscale('log')
-        axs[0].set_xlabel('Time Separation (t)')
-        axs[0].set_ylabel('G(t) (Connected)')
-        axs[0].set_title(f'2-point function (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
-        axs[0].grid(True, which="both", ls="--", alpha=0.5)  # 加了 alpha 让网格淡一点，不抢眼
-        axs[0].legend()  # 显示图例
-
-        # --- 右图：Effective Mass ---
-
-        # 设置宽高比 W:H = 1.4:1
-        axs[1].set_box_aspect(1 / 1.4)
-
-        axs[1].xaxis.set_major_locator(MaxNLocator(integer=True))
-        axs[1].errorbar(
-            np.arange(len(e_m_error_bar.numpy())),  # 假设这是对应的时间切片长度
-            effective_mass.numpy(),
-            yerr=y_err_m,
-            fmt='-o',
-            color='blue',
-            ecolor='purple',
-            capsize=4,
-            elinewidth=1.5,
-            label='Lattice Data'
-        )
-        axs[1].set_xlabel('Time Separation (t)')
-        axs[1].set_ylabel('Effective Mass')
-        axs[1].set_title(f'Effective Mass (L={CONFIG["L"]}, tao={CONFIG["tao"]})')
-        # axs[1].grid(True, which="both", ls="--") # 你之前注释掉了，我也保持注释状态
-        axs[1].legend()
-
-        # 3. 布局调整与显示
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"Plotting error: {e}")
-        import traceback
-        traceback.print_exc()
+    # delta_inverse_hamiltonian_tensor = torch.stack(delta_inverse_hamiltonian_list)
+    # delta_inverse_hamiltonian_tensor = delta_inverse_hamiltonian_tensor.transpose(0, 1).reshape(-1)
+    #
+    # delta_H_tensor = torch.stack(delta_H_list, dim=0)
+    # delta_H_tensor = delta_H_tensor.transpose(0, 1).reshape(-1)
+    #
+    # delta_phi_list_tensor = torch.stack(delta_phi_list, dim=0)
+    # delta_phi_list_tensor = delta_phi_list_tensor.transpose(0, 1).reshape(-1, L, L)
+    #
+    # delta_p_list_tensor = torch.stack(delta_p_list, dim=0)
+    # delta_p_list_tensor = delta_p_list_tensor.transpose(0, 1).reshape(-1, L, L)
+    #
+    # # shape:[N_bin, bin_size]
+    # binning_delta_H_tensor = binning(delta_H_tensor,config)
+    # # mean in bin
+    # binning_delta_H_tensor = binning_delta_H_tensor.mean(dim=1)
+    # bootstrap_delta_H_tensor = bootstrap(binning_delta_H_tensor, config['bootstrap_time'])
+    # delta_H_error = bootstrap_delta_H_tensor.std(dim=0)
+    # print(f'expect of delta_H:{torch.mean(delta_H_tensor).item():.2e}')
+    # print(f"{torch.mean(binning_delta_H_tensor):.5f}({int(delta_H_error * 1e5):02d})")
+    # delta_H_exp_tensor = torch.exp(-delta_H_tensor)
+    # binning_delta_H_exp_tensor = binning(delta_H_exp_tensor, config)
+    # binning_delta_H_exp_tensor = binning_delta_H_exp_tensor.mean(dim=0)
+    # bootstrap_delta_H_exp_tensor = bootstrap(binning_delta_H_exp_tensor, config['bootstrap_time'])
+    # delta_H_exp_error = bootstrap_delta_H_exp_tensor.std(dim=0)
+    #
+    # print(f'expect of delta_H_exp:{torch.mean(binning_delta_H_exp_tensor).item():.2e}')
+    # print(f'{torch.mean(binning_delta_H_exp_tensor):.2e}({int(delta_H_exp_error * 1e5):02d})')
+    # print(f'delta_H_exp_error:{delta_H_exp_error:.2e}')
+    #
+    # # print(f"ensemble_mean:{ensemble_tensor.mean().item():.2e}")
+    # # print(f'delta_inverse_hamiltonian_list:{delta_inverse_hamiltonian_list}')
+    # # delta_inverse_hamiltonian_tensor = torch.cat(delta_inverse_hamiltonian_list)
+    # # y = delta_inverse_hamiltonian_tensor  # 你的 1D torch tensor
+    # y = np.array([x.item() for x in delta_inverse_hamiltonian_tensor.cpu().numpy()])
+    # x = torch.arange(len(y))
+    #
+    # plt.figure()
+    # plt.plot(x, y)
+    # plt.xlabel("index")
+    # plt.ylabel("delta hamiltonian")
+    # plt.show()
+    #
+    # # delta_phi
+    # y = np.array([x.item() for x in delta_phi_list_tensor.mean(dim=(1, 2)).cpu().numpy()])
+    # x = torch.arange(len(y))
+    #
+    # plt.figure()
+    # plt.plot(x, y)
+    # plt.xlabel("index")
+    # plt.ylabel("delta phi")
+    # plt.show()
+    #
+    # # delta_p
+    # y = np.array([x.item() for x in delta_p_list_tensor.mean(dim=(1, 2)).cpu().numpy()])
+    # x = torch.arange(len(y))
+    #
+    # plt.figure()
+    # plt.plot(x, y)
+    # plt.xlabel("index")
+    # plt.ylabel("delta p")
+    # plt.show()
+    #
+    # # shape=(N_bin, bin_size, time, space)
+    # binning_ensemble = binning(ensemble_tensor,config)
+    # phi_to_1 = binning_ensemble.mean()
+    # bootstrap_phi_to_1 = bootstrap(binning_ensemble.mean(dim=1), config['bootstrap_time']).mean(dim=(1, 2))
+    # print(f"bootstrap_phi_to_1 shape: {bootstrap_phi_to_1.shape}")
+    # phi_to_1_error = bootstrap_phi_to_1.std(dim=0)
+    # print(f"phi_to_1_error shape: {phi_to_1_error.shape}")
+    # phi_to_2 = (binning_ensemble * binning_ensemble).mean()
+    # bootstrap_phi_to_2 = bootstrap((binning_ensemble ** 2).mean(dim=1), config['bootstrap_time']).mean(dim=(1, 2))
+    # phi_to_2_error = bootstrap_phi_to_2.std(dim=0)
+    # phi_to_3 = (binning_ensemble ** 3).mean()
+    # bootstrap_phi_to_3 = bootstrap((binning_ensemble ** 3).mean(dim=1), config['bootstrap_time']).mean(dim=(1, 2))
+    # phi_to_3_error = bootstrap_phi_to_3.std(dim=0)
+    # phi_to_4 = (binning_ensemble ** 4).mean()
+    # bootstrap_phi_to_4 = bootstrap((binning_ensemble ** 4).mean(dim=1), config['bootstrap_time']).mean(dim=(1, 2))
+    # phi_to_4_error = bootstrap_phi_to_4.std(dim=0)
+    # phi_to_5 = (binning_ensemble ** 5).mean()
+    # bootstrap_phi_to_5 = bootstrap((binning_ensemble ** 5).mean(dim=1), config['bootstrap_time']).mean(dim=(1, 2))
+    # phi_to_5_error = bootstrap_phi_to_5.std(dim=0)
+    # print("delta_H: {:.2e}".format(delta_H_tensor.mean().item()))
+    # print("expectation of exp delta_h: {:.2e}".format(torch.exp(-delta_H_tensor).mean().item()))
+    # print(f"phi_to_1:{phi_to_1:.2e}")
+    # print(f"{phi_to_1:.6f}({phi_to_1_error:.6f})")
+    # print(f"phi_to_2:{phi_to_2:.2e}")
+    # print(f"{phi_to_2:.6f}({phi_to_2_error:.6f})")
+    # print(f"phi_to_3:{phi_to_3:.2e}")
+    # print(f"{phi_to_3:.6f}({phi_to_3_error:.6f})")
+    # print(f"phi_to_4:{phi_to_4:.2e}")
+    # print(f"{phi_to_4:.6f}({phi_to_4_error:.6f})")
+    # print(f"phi_to_5:{phi_to_5:.2e}")
+    # print(f"{phi_to_5:.6f}({phi_to_5_error:.6f})")
+    # try:
+    #     # --- 修改开始：修正 Bootstrap G(t) 的逻辑 ---
+    #
+    #     # 1. 预计算每个 Bin 的基础统计量
+    #     print("Pre-calculating bins for correct Bootstrap...")
+    #
+    #     # Part A: 计算 Term 1 (Unconnected Two-point per bin)
+    #     # G_unc_bin: [N_bin, T]
+    #     G_unc_list = []
+    #     for t in range(config['L']):
+    #         corr_t_l_list = []
+    #         for l in range(config['L']):
+    #             # get_correlation 返回 [N_bin, bin_size]
+    #             c = get_correlation_for_single_configuration(binning_ensemble, t, l)
+    #             # 对 bin_size 求平均 -> [N_bin]
+    #             corr_t_l_list.append(c.mean(dim=1))
+    #
+    #             # 对空间体积 (loop l) 求平均 -> [N_bin]
+    #         corr_t = torch.stack(corr_t_l_list, dim=1).mean(dim=1)
+    #         G_unc_list.append(corr_t)
+    #
+    #     G_unc_bin = torch.stack(G_unc_list, dim=1)  # [N_bin, T]
+    #     print(f"G_unc_bin shape: {G_unc_bin.shape}")
+    #
+    #     # Part B: 计算 Term 2 的两个部分 (Explicitly shifted)
+    #     # 1. Origin Magnetization: <phi(x)>_bin
+    #     # binning_ensemble: [N_bin, bin_size, L, L] -> [N_bin]
+    #     mag_bin_origin = binning_ensemble.mean(dim=(1, 2, 3))
+    #
+    #     # 2. Shifted Magnetization: <phi(x+t)>_bin
+    #     # 我们必须为每一个时间 t 显式计算平移后的磁化强度
+    #     # 虽然在 PBC 下它数值上等于 origin，但为了符合物理含义显式计算
+    #     mag_bin_shifted_list = []
+    #     for t in range(config['L']):
+    #         # 在时间维度 (dim=2) 上平移
+    #         shifted_ensemble = torch.roll(binning_ensemble, shifts=t, dims=2)
+    #         # 计算平移后的 bin 均值 -> [N_bin]
+    #         mag_t = shifted_ensemble.mean(dim=(1, 2, 3))
+    #         mag_bin_shifted_list.append(mag_t)
+    #
+    #     # mag_bin_shifted: [N_bin, T]
+    #     mag_bin_shifted = torch.stack(mag_bin_shifted_list, dim=1)
+    #
+    #     # 2. 正确的 Bootstrap 循环 (对索引重采样)
+    #     print("Running correct Bootstrap loop (Explicit Shift)...")
+    #     G_t_boot_list = []
+    #     N_bin = binning_ensemble.shape[0]
+    #
+    #     for i in range(config['bootstrap_time']):
+    #         # 生成随机索引 (与数据在同一设备上)
+    #         idx = torch.randint(0, N_bin, (N_bin,), device=binning_ensemble.device)
+    #
+    #         # 提取当前样本的统计量
+    #         # 第一项：<phi(0)phi(t)> 的全局均值
+    #         G_unc_star = G_unc_bin[idx].mean(dim=0)  # [T]
+    #
+    #         # 第二项：显式计算 <phi(0)> * <phi(t)>
+    #         # <phi(0)>
+    #         mag_origin_star = mag_bin_origin[idx].mean()  # Scalar
+    #         # <phi(t)> (这是一个向量，对应每个 t)
+    #         mag_shifted_star = mag_bin_shifted[idx].mean(dim=0)  # [T]
+    #
+    #         # 组合计算 Connected Correlator
+    #         # Explicitly: <OO> - <O_origin> * <O_shifted>
+    #         G_conn_star = G_unc_star - mag_origin_star * mag_shifted_star
+    #
+    #         G_t_boot_list.append(G_conn_star)
+    #
+    #     # 得到 G(t) 的分布
+    #     bootstrap_ensemble_tensor = torch.stack(G_t_boot_list)  # [Boot, T]
+    #     print(f"bootstrap_tensor's shape:{bootstrap_ensemble_tensor.shape}")
+    #
+    #     # 3. 统计结果
+    #     G_error_bar = bootstrap_ensemble_tensor.std(dim=0)
+    #     y_err_g = G_error_bar.numpy()
+    #
+    #     # G_t 的中心值取 Bootstrap 分布的均值
+    #     G_t = bootstrap_ensemble_tensor.mean(dim=0)
+    #
+    #     # --- 修改结束 ---
+    #
+    #     print("G_t values:")
+    #     for t_val in G_t:
+    #         print(f"{t_val.item():.16E}")
+    #
+    #     print("y_err_g:")
+    #     for t_val in y_err_g:
+    #         print(f"{t_val.item():.16E}")
+    #
+    #     # effective mass
+    #     # shape=(time)
+    #     effective_mass = get_effective_mass(G_t)
+    #     effective_mass = effective_mass[1:-1]
+    #     bootstrap_effective_mass = get_effective_mass(bootstrap_ensemble_tensor)
+    #     bootstrap_effective_mass = bootstrap_effective_mass[:, 1:-1]
+    #     e_m_error_bar = bootstrap_effective_mass.std(dim=0)
+    #     y_err_m = e_m_error_bar.numpy()
+    #     # 1. 设置画布
+    #     # 两个图都是 1.4:1 的宽图，并排显示，建议把画布宽度设大一点，比如 (10, 4) 或 (12, 5)
+    #     fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    #
+    #     # --- 左图：Green Function G(t) ---
+    #
+    #     # 设置宽高比 W:H = 1.4:1 -> H/W = 1/1.4
+    #     axs[0].set_box_aspect(1 / 1.4)
+    #
+    #     axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
+    #     axs[0].errorbar(
+    #         np.arange(len(G_t.numpy())),
+    #         G_t.numpy(),
+    #         yerr=y_err_g,
+    #         fmt='-o',  # 格式: '-'连线, 'o'点
+    #         color='blue',  # 数据颜色
+    #         ecolor='purple',  # 误差棒颜色
+    #         capsize=4,  # 误差棒帽子宽度
+    #         elinewidth=1.5,  # 误差棒线宽
+    #         label='Lattice Data'
+    #     )
+    #     axs[0].set_yscale('log')
+    #     axs[0].set_xlabel('Time Separation (t)')
+    #     axs[0].set_ylabel('G(t) (Connected)')
+    #     axs[0].set_title(f'2-point function (L={config["L"]}, tao={config["tao"]})')
+    #     axs[0].grid(True, which="both", ls="--", alpha=0.5)  # 加了 alpha 让网格淡一点，不抢眼
+    #     axs[0].legend()  # 显示图例
+    #
+    #     # --- 右图：Effective Mass ---
+    #
+    #     # 设置宽高比 W:H = 1.4:1
+    #     axs[1].set_box_aspect(1 / 1.4)
+    #
+    #     axs[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+    #     axs[1].errorbar(
+    #         np.arange(len(e_m_error_bar.numpy())),  # 假设这是对应的时间切片长度
+    #         effective_mass.numpy(),
+    #         yerr=y_err_m,
+    #         fmt='-o',
+    #         color='blue',
+    #         ecolor='purple',
+    #         capsize=4,
+    #         elinewidth=1.5,
+    #         label='Lattice Data'
+    #     )
+    #     axs[1].set_xlabel('Time Separation (t)')
+    #     axs[1].set_ylabel('Effective Mass')
+    #     axs[1].set_title(f'Effective Mass (L={config["L"]}, tao={config["tao"]})')
+    #     # axs[1].grid(True, which="both", ls="--") # 你之前注释掉了，我也保持注释状态
+    #     axs[1].legend()
+    #
+    #     # 3. 布局调整与显示
+    #     plt.tight_layout()
+    #     plt.show()
+    # except Exception as e:
+    #     print(f"Plotting error: {e}")
+    #     import traceback
+    #     traceback.print_exc()
 
 
 if __name__ == '__main__':
-    main()
+    for config in CONFIG:
+        main(config)

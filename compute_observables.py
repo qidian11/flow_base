@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from cnn_res_net import CONFIG
+from HMC_final import CONFIG
 
 
 def get_device(prefer="auto"):
@@ -54,6 +54,23 @@ def compute_observables_with_error(ensemble_tensor, bin_size, boot_time):
     M_binned = M_binned.view(total_bins)
 
     # ---------------------------------------------------------
+    # 【新增】Step 1.5: 提取 phi^1 到 phi^5 并进行 Binning
+    # ---------------------------------------------------------
+    print("1.5 正在计算 phi^1 到 phi^5 的期望值并进行 Binning...")
+    phi_pow_binned_list = []
+    for power in range(1, 6):
+        if power == 1:
+            # phi^1 就是上面的 M_binned，直接复用避免重复计算
+            phi_pow_binned_list.append(M_binned)
+        else:
+            pow_all = (ensemble_trunc ** power).mean(dim=(2, 3))
+            pow_binned = pow_all.view(n_bins, bin_size, batchsize).mean(dim=1).view(total_bins)
+            phi_pow_binned_list.append(pow_binned)
+
+    # 打包成一个张量，shape: [total_bins, 5]
+    phi_pow_binned_tensor = torch.stack(phi_pow_binned_list, dim=1)
+
+    # ---------------------------------------------------------
     # Step 2: 双循环计算关联函数 + 零动量投影 + Binning
     # ---------------------------------------------------------
     print("2. 正在通过双循环平移计算两点关联函数 (这比FFT略慢，请耐心等待)...")
@@ -97,6 +114,8 @@ def compute_observables_with_error(ensemble_tensor, bin_size, boot_time):
     # ---------------------------------------------------------
     G_unc_full_mean = G_unc_binned.mean(dim=0)
     M_full_mean = M_binned.mean()
+    # 【新增】phi^1 到 phi^5 的中心值, shape: [5]
+    phi_pow_central = phi_pow_binned_tensor.mean(dim=0)
 
     # 连通图 = 非连通图 - 零动量背景 = 非连通图 - L_s * <phi>^2
     G_conn_central = G_unc_full_mean - L_s * (M_full_mean ** 2)
@@ -112,6 +131,7 @@ def compute_observables_with_error(ensemble_tensor, bin_size, boot_time):
     print(f"3. Bootstrap 重组宇宙 {boot_time} 次以提取真实误差棒...")
     G_conn_boot_list = []
     m_eff_boot_list = []
+    phi_pow_boot_list = []  # 【新增】用于收集每次 bootstrap 的 phi^n
 
     for _ in range(boot_time):
         # 每次有放回地抽取相互独立的宇宙块
@@ -120,6 +140,10 @@ def compute_observables_with_error(ensemble_tensor, bin_size, boot_time):
         # 1. 抽取当前宇宙的基础量
         G_unc_star = G_unc_binned[idx].mean(dim=0)
         M_star = M_binned[idx].mean()
+
+        # 【新增】抽取当前的 phi^n 期望
+        phi_pow_star = phi_pow_binned_tensor[idx].mean(dim=0)
+        phi_pow_boot_list.append(phi_pow_star)
 
         # 2. 减去真空断开图，得到连通信号
         G_conn_star = G_unc_star - L_s * (M_star ** 2)
@@ -137,9 +161,10 @@ def compute_observables_with_error(ensemble_tensor, bin_size, boot_time):
     # 计算标准差作为误差棒
     G_conn_err = torch.stack(G_conn_boot_list).std(dim=0)
     m_eff_err = torch.stack(m_eff_boot_list).std(dim=0)
+    phi_pow_err = torch.stack(phi_pow_boot_list).std(dim=0)  # 【新增】phi^n 的误差棒
 
     print("--- 物理统计管线执行完毕 ---\n")
-    return G_conn_central, G_conn_err, m_eff_central, m_eff_err
+    return G_conn_central, G_conn_err, m_eff_central, m_eff_err, phi_pow_central, phi_pow_err
 
 
 # ==========================================
@@ -152,7 +177,8 @@ def main(ensemble_tensor, bin_size=100, boot_time=2000):
     # 分析矩阵可以放回 GPU 加速计算
     ensemble_tensor = ensemble_tensor.to(device)
 
-    G_t_mean, G_t_err, m_eff_mean, m_eff_err = compute_observables_with_error(
+    # 【更新】接收额外返回的 phi_pow 数据
+    G_t_mean, G_t_err, m_eff_mean, m_eff_err, phi_pow_mean, phi_pow_err = compute_observables_with_error(
         ensemble_tensor,
         bin_size=bin_size,
         boot_time=boot_time
@@ -163,7 +189,33 @@ def main(ensemble_tensor, bin_size=100, boot_time=2000):
     G_t_err = G_t_err.cpu().numpy()
     m_eff_mean = m_eff_mean.cpu().numpy()
     m_eff_err = m_eff_err.cpu().numpy()
+    phi_pow_mean = phi_pow_mean.cpu().numpy()
+    phi_pow_err = phi_pow_err.cpu().numpy()
+
+    # 将计算结果打包保存为 npz 文件
+    # 文件名自动带上当前的晶格尺寸 L
+    save_filename = f"{CONFIG['Type']}_observables_result_L{CONFIG['L']}_double_precision_{CONFIG['double precision']}.npz"
+    np.savez_compressed(
+        save_filename,
+        G_t_mean=G_t_mean,
+        G_t_err=G_t_err,
+        m_eff_mean=m_eff_mean,
+        m_eff_err=m_eff_err,
+        phi_pow_mean=phi_pow_mean,
+        phi_pow_err=phi_pow_err,
+        L=CONFIG['L']  # 顺便把 L 也存进去，画图的时候方便用
+    )
+
+    print("\n" + "=" * 40)
+    print(f"🎉 计算完成！所有统计数据已成功打包保存至: {save_filename}")
+    print("=" * 40 + "\n")
+
     print("\n========== 数值结果 ==========\n")
+    # 【新增】打印 phi^1 到 phi^5 的期望值与误差 (保留 6 位小数)
+    print("------ Phi Powers Expectation ------")
+    for power in range(1, 6):
+        print(f"phi^{power}: {phi_pow_mean[power - 1]:.6f} ± {phi_pow_err[power - 1]:.6f}")
+    print("-" * 36 + "\n")
 
     print("t    G_c(t)              error")
     for t in range(len(G_t_mean)):
@@ -184,7 +236,7 @@ def main(ensemble_tensor, bin_size=100, boot_time=2000):
     axs[0].errorbar(
         t_axis, G_t_mean, yerr=G_t_err,
         fmt='-o', color='darkblue', ecolor='purple', capsize=4, elinewidth=1.5,
-        label='HMC Lattice Data', markersize=4
+        label='pre-sampling Lattice Data', markersize=4
     )
     axs[0].set_yscale('log')
     axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
@@ -220,9 +272,10 @@ def main(ensemble_tensor, bin_size=100, boot_time=2000):
 
 
 if __name__ == '__main__':
+    CONFIG= CONFIG[-1]
     ensemble_path = CONFIG['phi_ensemble_save_path']
     data = np.load(ensemble_path)
     # 假设你之前存的是 npz 文件中的 'configs'
     loaded_configs = data['configs']
-    ensemble_tensor = torch.from_numpy(loaded_configs)
+    ensemble_tensor = torch.from_numpy(loaded_configs).to(dtype=DTYPE)
     main(ensemble_tensor)
