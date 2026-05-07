@@ -1,16 +1,13 @@
 import torch
 import numpy as np
-from prior_cnn_net import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
+from prior_cnn_multi_kernel import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
+# from prior_cnn_net import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
 
 
-def load_trained_model(checkpoint_path, L, coupling_layers=16, hidden_channels=16, num_hidden_layers=12):
+def load_trained_model(checkpoint_path):
     """加载保存的模型权重"""
     model = FlowModel(
-        L=L,
-        coupling_layers=coupling_layers,
-        hidden_channels=hidden_channels,
-        num_hidden_layers=num_hidden_layers,
-        kernel_size=CONFIG['kernel_size'],
+        CONFIG
     ).to(device)
 
     if CONFIG.get('double precision', False):
@@ -122,7 +119,7 @@ def produce_ensemble(model, prior, total_n=100000, batch_size=1024):
 
 if __name__ == "__main__":
     PATH = CONFIG['save_path']
-    PATH = 'best_prior_cnn_res_model_double_precision_True_14_coupling_layers_32_hidden_layers_6_hidden_channels_16_iterations_45000.pt'
+    # PATH = 'best_prior_cnn_res_model_double_precision_True_14_coupling_layers_32_hidden_layers_6_hidden_channels_16_iterations_45000.pt'
     print(f"模型加载路径: {PATH}")
 
     if CONFIG.get('double precision', False):
@@ -130,11 +127,7 @@ if __name__ == "__main__":
         print('double precision: True')
 
     trained_model = load_trained_model(
-        PATH,
-        CONFIG['L'],
-        coupling_layers=CONFIG['coupling_layers'],
-        hidden_channels=CONFIG['hidden_channels'],
-        num_hidden_layers=CONFIG['hidden_layers']
+        PATH
     )
 
     # --- 实例化并配置 FreeFieldPrior ---

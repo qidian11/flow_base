@@ -39,6 +39,7 @@ def auto_find_latest_checkpoint(config):
     base_pattern = (
         f"prior_cnn_res_model_double_precision_*_"
         f"{config['L']}_coupling_layers_{config['coupling_layers']}_"
+        f"kernel_size_{CONFIG['kernel_size']}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
     )
@@ -80,35 +81,35 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 # 1. 物理参数配置
 # ==========================================
-CONFIG = {
-    'Type': 'Prior_CNN',
-    'L': 14,  # 晶格大小 (对应实验 E5)
-    'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
-    'lam': 5.113,  # lambda (耦合常数)
-    'batch_size': 2048,  # 批大小
-    'lr': 1e-6,  # 学习率
-    'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
-    'iterations': 45000,  # 训练迭代次数
-    'coupling_layers': 32,
-    'kernel_size': 3,
-    'hidden_layers': 6,  # 实际上是6*3
-    'hidden_channels': 16,
-    'double precision': True,
-}
 # CONFIG = {
+#     'Type': 'Prior_CNN',
 #     'L': 14,  # 晶格大小 (对应实验 E5)
 #     'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
 #     'lam': 5.113,  # lambda (耦合常数)
-#     'batch_size': 1024,  # 批大小
-#     'lr': 1e-5,  # 学习率
+#     'batch_size': 2048,  # 批大小
+#     'lr': 1e-6,  # 学习率
 #     'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
-#     'iterations': 25000,  # 训练迭代次数
-#     'coupling_layers': 14,
-#     'kernel_size': 6,
+#     'iterations': 45000,  # 训练迭代次数
+#     'coupling_layers': 32,
+#     'kernel_size': 3,
 #     'hidden_layers': 6,  # 实际上是6*3
 #     'hidden_channels': 16,
-#     'double precision': False,
+#     'double precision': True,
 # }
+CONFIG = {
+    'L': 14,  # 晶格大小 (对应实验 E5)
+    'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
+    'lam': 5.113,  # lambda (耦合常数)
+    'batch_size': 1024,  # 批大小
+    'lr': 2e-5,  # 学习率
+    'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
+    'iterations': 25000,  # 训练迭代次数
+    'coupling_layers': 14,
+    'kernel_size': 5,
+    'hidden_layers': 6,  # 实际上是6*3
+    'hidden_channels': 16,
+    'double precision': False,
+}
 save_path = f"best_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
 loss_save_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
 checkpoint_path = f"latest_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
@@ -149,11 +150,13 @@ def create_checkerboard_mask(L):
 class ResBlock(nn.Module):
     def __init__(self, channels, kernel_size=3):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=1, padding_mode='circular')
+        # 动态计算 padding
+        pad = kernel_size // 2
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular')
         self.act1 = nn.LeakyReLU(0.01)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=1, padding_mode='circular')
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular')
         self.act2 = nn.LeakyReLU(0.01)
-        self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=1, padding_mode='circular')
+        self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular')
         self.act3 = nn.LeakyReLU(0.01)
 
     def forward(self, x):
@@ -164,13 +167,14 @@ class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4,kernel_size=3):
         super().__init__()
         layers = []
-        layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1, padding=1, padding_mode='circular'))
+        layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1, padding=0, padding_mode='circular'))
         layers.append(nn.LeakyReLU(0.01))
 
         for _ in range(num_hidden_layers):
-            layers.append(ResBlock(hidden_channels))
-
-        layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=3, stride=1, padding=1, padding_mode='circular'))
+            layers.append(ResBlock(hidden_channels,kernel_size=kernel_size))
+        # 修复2：动态计算最后一层的 padding
+        pad = kernel_size // 2
+        layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular'))
         self.net = nn.Sequential(*layers)
 
         for m in self.modules():
@@ -240,17 +244,23 @@ class FreeFieldPrior(nn.Module):
 # 5. 修改：流模型 (仅负责非线性双射，不再自带标准正态噪声)
 # ==========================================
 class FlowModel(nn.Module):
-    def __init__(self, L, coupling_layers=12, hidden_channels=16, num_hidden_layers=12, kernel_size=3):
+    def __init__(self, config):
         super().__init__()
-        self.L = L
-        self.coupling_layers = coupling_layers
-        self.register_buffer('base_mask', create_checkerboard_mask(L))
-        self.context_nets = nn.ModuleList(
-            [ConvContextNet(hidden_channels=hidden_channels,
-                            num_hidden_layers=num_hidden_layers,
-                            kernel_size=kernel_size)
-             for _ in range(coupling_layers)])
-        print(f'当前模型耦合层：{coupling_layers} 通道数：{hidden_channels}， 隐藏层：{num_hidden_layers}, 卷积核：{kernel_size}x{kernel_size}')
+        self.L = config['L']
+        self.coupling_layers = config['coupling_layers']
+        self.register_buffer('base_mask', create_checkerboard_mask(self.L))
+
+        # 从 config 优雅解包
+        self.context_nets = nn.ModuleList([
+            ConvContextNet(
+                hidden_channels=config['hidden_channels'],
+                num_hidden_layers=config['hidden_layers'],
+                kernel_size=config.get('kernel_size', 3)
+            ) for _ in range(self.coupling_layers)
+        ])
+        print(
+            f"当前单核模型耦合层：{self.coupling_layers} 通道数：{config['hidden_channels']}， 隐藏层：{config['hidden_layers']}, 卷积核：{config.get('kernel_size', 3)}")
+
 
     def forward(self, z):
         """
@@ -281,15 +291,14 @@ class FlowModel(nn.Module):
 # ==========================================
 # 6. 自训练循环
 # ==========================================
-def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path'], resume=True,
-          checkpoint_path=CONFIG['checkpoint_path']):
-    L = CONFIG['L']
+def train(config, resume = True):
+    save_path = config['save_path']
+    loss_save_path = config['loss_save_path']
+    checkpoint_path = config['checkpoint_path']
+    L = config['L']
 
     # 实例化流模型
-    model = FlowModel(L=L, coupling_layers=CONFIG['coupling_layers'],
-                      hidden_channels=CONFIG['hidden_channels'],
-                      num_hidden_layers=CONFIG['hidden_layers'],
-                      kernel_size=CONFIG['kernel_size']).to(device)
+    model = FlowModel(config).to(device)
 
     # 【新增】实例化自由场先验 (因为处于破缺相，使用质量的绝对值作为先验的正质量 m_0^2)
     prior_m_sq = abs(CONFIG['m_sq'])
@@ -309,7 +318,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
         model = torch.compile(model)
     # ==========================================
 
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
+    optimizer = optim.Adam(model.parameters(), lr=config['lr'])
     # 开启退火
     scheduler = None
     if CONFIG.get('use_scheduler', True):
@@ -344,18 +353,18 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
                 history_loss = checkpoint['history_loss']
                 print(f"成功从 checkpoint 恢复历史 Loss，当前有 {len(history_loss)} 条未平滑原始数据。")
 
-            print(f"恢复成功！将从第 {start_iteration} 步继续训练至 {CONFIG['iterations']} 步。")
+            print(f"恢复成功！将从第 {start_iteration} 步继续训练至 {config['iterations']} 步。")
         else:
             print("未找到断点文件，将从头开始训练。")
 
     model.train()
     print("开始基于自由场先验的自训练...")
 
-    for iteration in range(start_iteration, CONFIG['iterations'] + 1):
+    for iteration in range(start_iteration, config['iterations'] + 1):
         optimizer.zero_grad()
 
         # 1. 从自由场先验中取样，得到自由场构型 z 及其确切对数概率 log_p_z
-        z, log_p_z = prior.sample(CONFIG['batch_size'])
+        z, log_p_z = prior.sample(config['batch_size'])
 
         # 2. 通过流模型，加入 phi^4 相互作用的微调变形
         phi, log_det_J = model(z)
@@ -429,4 +438,4 @@ if __name__ == "__main__":
     if CONFIG.get('double precision', False):
         torch.set_default_dtype(torch.float64)
         print('开启双精度')
-    train(CONFIG['save_path'], CONFIG['loss_save_path'])
+    train(CONFIG)

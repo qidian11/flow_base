@@ -40,7 +40,7 @@ CONFIG = [
     'bootstrap_time': 2000,
     'batch_size': 128,
     'ensemble_save_path': 'HMC_6_.npz',
-    'loss_save_path':'normalizing_flow_loss_6_20000}.npy'
+    'loss_save_path':'normalizing_flow_loss_6_20000.npy'
 },
     {
     'L': 8,
@@ -55,7 +55,7 @@ CONFIG = [
     'bootstrap_time': 2000,
     'batch_size': 128,
     'model_save_path': 'normalizing_flow_best_model_8_30000.pt',
-    'loss_save_path':'normalizing_flow_loss_8_30000}.npy'
+    'loss_save_path':'normalizing_flow_loss_8_30000.npy'
 },
     {
     'L': 10,
@@ -70,7 +70,7 @@ CONFIG = [
     'bootstrap_time': 2000,
     'batch_size': 128,
 'model_save_path': 'normalizing_flow_best_model_10_50000.pt',
-    'loss_save_path':'normalizing_flow_loss_10_50000}.npy'
+    'loss_save_path':'normalizing_flow_loss_10_50000.npy'
 },
     {
     'L': 12,
@@ -85,7 +85,7 @@ CONFIG = [
     'bootstrap_time': 2000,
     'batch_size': 128,
 'model_save_path': 'normalizing_flow_best_model_12_80000.pt',
-    'loss_save_path':'normalizing_flow_loss_12_80000}.npy'
+    'loss_save_path':'normalizing_flow_loss_12_80000.npy'
 },{
     'Type': 'HMC',
     'L': 14,
@@ -101,7 +101,7 @@ CONFIG = [
     'batch_size': 128,
     'double precision': True,
     'model_save_path': 'normalizing_flow_best_model_14_100000.pt',
-    'loss_save_path':'normalizing_flow_loss_14_100000}.npy',
+    'loss_save_path':'normalizing_flow_loss_14_100000.npy',
     'phi_ensemble_save_path': ''
 },]
 
@@ -151,7 +151,7 @@ def calculate_kinetic_energy(p):
     return 0.5 * torch.sum(p ** 2, dim=(1, 2))
 
 
-def calculate_hamiltonian(phi, p,config):
+def calculate_hamiltonian(phi, p, config):
     action = calculate_action(phi,config)
     kinetic_energy = calculate_kinetic_energy(p)
     return kinetic_energy + action
@@ -202,7 +202,7 @@ def leap_frog(phi, p, tao, config):
     return phi_new, p_new
 
 
-def HMC_step(phi, tao):
+def HMC_step(phi, tao, config):
     # 1. 为每条链独立生成动量
     p = torch.randn_like(phi)
     h_old = calculate_hamiltonian(phi, p,config)
@@ -229,7 +229,7 @@ def HMC_step(phi, tao):
         return phi, delta_H, delta_inverse_H, delta_phi, delta_p, False, 0.0
 
     # 5. Metropolis 接受/拒绝 (Per-chain)
-    prob = torch.exp(-delta_H.clamp(max=50))  # 防止溢出
+    prob = torch.exp((-delta_H).clamp(max=50))  # 防止溢出
     rand_num = torch.rand_like(prob)
     accepted_mask = rand_num < prob  # [Batch] 的布尔掩码
 
@@ -335,7 +335,7 @@ def main(config):
     print("Start Thermalization...")
     step = 0
     while step < config['thermal_steps']:
-        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, config['tao'])
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, config['tao'], config)
 
         if not success:
             print(f"Thermal Step {step}: NaN detected! Retrying...")
