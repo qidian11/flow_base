@@ -1,16 +1,12 @@
 import torch
 import numpy as np
-from cnn_res_net import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
+from attention_plus import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
 
 
-def load_trained_model(checkpoint_path, L, coupling_layers=16, hidden_channels=16,
-                      num_hidden_layers=12):
+def load_trained_model(checkpoint_path, config):
     """加载保存的模型权重"""
-    model = FlowModel(L=L,coupling_layers=coupling_layers,
-                      hidden_channels=hidden_channels,
-                      num_hidden_layers=num_hidden_layers
-                      ).to(device)
-    if CONFIG.get('double precision', False): # 开启双精度
+    model = FlowModel(config).to(device)
+    if CONFIG.get('double_precision', False): # 开启双精度
         # 显式转换为双精度
         model = model.double()
     # map_location 确保在没有 GPU 的机器上也能加载
@@ -104,10 +100,7 @@ if __name__ == "__main__":
     if CONFIG.get('double precision', False): # 开启双精度
         torch.set_default_dtype(torch.float64)
         print('double precision: True')
-    trained_model = load_trained_model(PATH, CONFIG['L'],
-                                       coupling_layers=CONFIG['coupling_layers'],
-                                       hidden_channels=CONFIG['hidden_channels'],
-                                        num_hidden_layers=CONFIG['hidden_layers'])
+    trained_model = load_trained_model(PATH, CONFIG)
 
     # 生成 10,0000 个构型
     final_configs, accept_traj = produce_ensemble(trained_model, total_n=100000)

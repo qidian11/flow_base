@@ -47,9 +47,9 @@ CONFIG = {
     'batch_size': 1024,  # 批大小
     'lr': 1e-3,  # 学习率
     'iterations': 15000,  # 训练迭代次数
-    'coupling_layers': 16,
-    'hidden_layers': 6, # 实际上是6*3
-    'hidden_channels': 16,
+    'coupling_layers': 12,
+    'hidden_layers': 4, # 实际上是4*3
+    'hidden_channels': 256,
     'double precision': False,
 }
 save_path = f"best_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
@@ -150,8 +150,12 @@ class ConvContextNet(nn.Module):
 # 4. 流模型定义 (完全生成模式)
 # ==========================================
 class FlowModel(nn.Module):
-    def __init__(self, L, coupling_layers=12, hidden_channels=16, num_hidden_layers=12):  # 默认12个耦合层
+    def __init__(self, config):  # 默认12个耦合层
         super().__init__()
+        L = config['L']
+        coupling_layers = config['coupling_layers']
+        hidden_channels = config['hidden_channels']
+        num_hidden_layers = config['hidden_layers']
         self.L = L
         self.coupling_layers = coupling_layers
         self.register_buffer('base_mask', create_checkerboard_mask(L))
@@ -208,9 +212,7 @@ class FlowModel(nn.Module):
 # ==========================================
 def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path'], resume=True, checkpoint_path=CONFIG['checkpoint_path']):
     L = CONFIG['L']
-    model = FlowModel(L=L, coupling_layers=CONFIG['coupling_layers'],
-                      hidden_channels=CONFIG['hidden_channels'],
-                      num_hidden_layers=CONFIG['hidden_layers']).to(device)
+    model = FlowModel(CONFIG).to(device)
     if CONFIG['double precision']:
         # 显式转换为双精度
         model = model.double()

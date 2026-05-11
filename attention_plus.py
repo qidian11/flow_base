@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import math
 import numpy as np
@@ -24,17 +25,19 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    # 根据新增加的开关，决定搜索哪种架构的文件
+    layer_str = f"layers_{config['cnn_coupling_layers']}cnn_{config['attn_coupling_layers']}attn"
+    depth_str = f"depth_{config.get('branch_depth', 3)}"
+
     if config.get('use_multi_kernel', False):
         sizes_str = '_'.join(map(str, config['multi_kernel_sizes']))
         dilations_str = '_'.join(map(str, config.get('multi_kernel_dilations', (1, 1, 1))))
-        k_str = f"multi_kernels_{sizes_str}_dilations_{dilations_str}"
+        k_str = f"multi_k_{sizes_str}_dil_{dilations_str}_{depth_str}_{layer_str}"
     else:
-        k_str = f"kernel_size_{config['kernel_size']}"
+        k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
     base_pattern = (
         f"prior_cnn_res_model_double_precision_*_"
-        f"{config['L']}_coupling_layers_{config['coupling_layers']}_"
+        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'] + config['attn_coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
@@ -71,40 +74,44 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置
 # ==========================================
 CONFIG = {
-    # --- 原有字段 (严格保持不变) ---
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
     'batch_size': 512,
-    'lr': 3e-6,
-    'use_scheduler': False,
-    'iterations': 40000,
-    'coupling_layers': 14,
-    'kernel_size': 14,  # 原汁原味的旧参数，如果你关掉多核开关，网络就会用这个
-    'hidden_layers': 4,
-    'hidden_channels': 128,
-    'double precision': False,
+    'lr': 1e-4,
+    'use_scheduler': True,
+    'scheduler_min': 5e-6,
+    'iterations': 30000,
 
-    # === 新增字段 (控制多尺度卷积) ===
-    'use_multi_kernel': True,  # 设为 False 则退回你的原版单架构网络
-    'multi_kernel_sizes': (1, 3, 5),  # 这里自定义多尺度的大小
-    'multi_kernel_dilations': (1, 1, 1), # <--- 在这里任意修改每个核的空洞率！
+    'cnn_coupling_layers': 12,
+    'attn_coupling_layers': 0,
+
+    'kernel_size': 3,
+    'hidden_layers': 4,
+    'branch_depth': 2,
+    'hidden_channels': 256,
+    'double_precision': False,
+
+    'use_multi_kernel': True,
+    'multi_kernel_sizes': (3,),
+    'multi_kernel_dilations': (1,),
 }
 
-# 动态生成文件名中的标识（加入 dilations）
+total_coupling_layers = CONFIG['cnn_coupling_layers'] + CONFIG['attn_coupling_layers']
+layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn_{CONFIG['attn_coupling_layers']}attn"
+depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
+
 if CONFIG.get('use_multi_kernel', False):
     sizes_str = '_'.join(map(str, CONFIG['multi_kernel_sizes']))
     dilations_str = '_'.join(map(str, CONFIG.get('multi_kernel_dilations', (1, 1, 1))))
-    k_str = f"multi_kernels_{sizes_str}_dilations_{dilations_str}"
+    k_str = f"multi_k_{sizes_str}_dil_{dilations_str}_{depth_str}_{layer_str}"
 else:
-    k_str = f"kernel_size_{CONFIG['kernel_size']}"
+    k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-
-# 文件名生成
-save_path = f"best_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+save_path = f"best_prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -134,7 +141,85 @@ def create_checkerboard_mask(L):
     return mask_2d.view(1, 1, L, L).float()
 
 
-# --- 你的原版单分支网络 (已修复 padding 越界 bug) ---
+# ==========================================
+# 🌟 全新重构：标准非对称全局特征注意力机制
+# ==========================================
+class CorrelationLatticeAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, channels)
+
+        # 内部特征提取维度 (可以设为与 channels 相等)
+        self.head_dim = channels
+
+        # 1. 特征提取矩阵 (W_Q, W_K, W_V)
+        # 用 1x1 卷积实现物理空间的独立映射，替代你原来的 x_unit
+        self.q_proj = nn.Conv2d(channels, self.head_dim, kernel_size=1)
+        self.k_proj = nn.Conv2d(channels, self.head_dim, kernel_size=1)
+        self.v_proj = nn.Conv2d(channels, self.head_dim, kernel_size=1)
+
+        # 2. 特征反馈矩阵 (W_O)
+        # 将聚合后的全局关联特征，翻译回原物理通道空间
+        self.out_proj = nn.Conv2d(self.head_dim, channels, kernel_size=1)
+
+        # 保证初始残差恒等映射
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+        # 3. 保方差的融合门控
+        self.gamma_logit = nn.Parameter(torch.tensor(-5.0))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        N = H * W
+
+        # 预处理：标准化特征流形
+        x_norm = self.norm(x)
+
+        # 提取特征并展平空间以进行全局路由
+        # q: (B, D, N)  |  k: (B, D, N)  |  v: (B, D, N)
+        q = self.q_proj(x_norm).view(B, self.head_dim, N)
+        k = self.k_proj(x_norm).view(B, self.head_dim, N)
+        v = self.v_proj(x_norm).view(B, self.head_dim, N)
+
+        # 计算非对称相似度 (用数学上严谨的 1/sqrt(d_k) 缩放替代手工 beta)
+        # 此时 bnm 含义：第 n 个格点的查询，去匹配第 m 个格点的特征
+        attn = torch.einsum('bdn,bdm->bnm', q, k) / math.sqrt(self.head_dim)
+        attn = torch.softmax(attn, dim=-1)
+
+        # 聚合全局特征 V
+        # bdm 代表 m 格点的特征，bnm 代表分配权重，聚合回 bdn (n 格点的新特征)
+        out = torch.einsum('bdm,bnm->bdn', v, attn)
+
+        # 折叠回物理空间形状
+        out = out.view(B, self.head_dim, H, W)
+
+        # 使用 W_O 矩阵进行特征反馈
+        out = self.out_proj(out)
+
+        # 动态计算融合系数 gamma
+        gamma = torch.sigmoid(self.gamma_logit)
+
+        return (1.0 - gamma) * x + gamma * out
+
+
+class GlobalAttentionContextNet(nn.Module):
+    def __init__(self, hidden_channels=256):
+        super().__init__()
+        self.in_conv = nn.Conv2d(1, hidden_channels, kernel_size=1)
+        self.act = nn.LeakyReLU(0.01)
+        self.attention = CorrelationLatticeAttention(hidden_channels)
+        self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x):
+        h = self.act(self.in_conv(x))
+        h = self.attention(h)
+        return self.out_conv(h)
+
+
 class ResBlock(nn.Module):
     def __init__(self, channels, kernel_size=3):
         super().__init__()
@@ -153,58 +238,51 @@ class ResBlock(nn.Module):
         return x + self.act3(self.conv3(self.act2(self.conv2(self.act1(self.conv1(x))))))
 
 
-# --- 新的多尺度网络 ---
 class MultiScaleResBlock(nn.Module):
-    def __init__(self, channels, kernel_sizes=(3, 5, 7), dilations=(1, 1, 1)):
+    def __init__(self, channels, kernel_sizes=(3, 5, 7), dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
-
-        # 1. 确保传入的卷积核大小和空洞率的数量是一一对应的
         assert len(kernel_sizes) == len(dilations), "卷积核数量和空洞率数量必须严格匹配！"
 
-        # 2. 使用 nn.ModuleList 动态装载任意数量的卷积层
-        self.convs = nn.ModuleList()
+        self.branches = nn.ModuleList()
         for k, d in zip(kernel_sizes, dilations):
             assert k % 2 != 0, f"多尺度卷积核必须均为奇数！当前输入了偶数核: {k}"
-
-            # 动态计算 padding 保证特征图长宽不变 (考虑了 dilation 的影响)
             pad = d * (k - 1) // 2
+            layers = []
+            for _ in range(branch_depth):
+                layers.append(
+                    nn.Conv2d(channels, channels, kernel_size=k, stride=1, padding=pad, dilation=d,
+                              padding_mode='circular')
+                )
+                layers.append(nn.LeakyReLU(0.01))
+            self.branches.append(nn.Sequential(*layers))
 
-            self.convs.append(
-                nn.Conv2d(channels, channels, kernel_size=k, stride=1, padding=pad, dilation=d, padding_mode='circular')
-            )
-
-        self.act = nn.LeakyReLU(0.01)
-
-        # 3. 融合层的输入通道数自动根据你指定的分支数量进行计算
         num_branches = len(kernel_sizes)
         self.fusion_conv = nn.Conv2d(channels * num_branches, channels, kernel_size=1)
 
     def forward(self, x):
-        # 遍历执行所有卷积分支，并将结果收集到列表中
-        outs = [conv(x) for conv in self.convs]
-
-        # 在通道维度拼接所有分支的结果
+        outs = [branch(x) for branch in self.branches]
         out = torch.cat(outs, dim=1)
-        out = self.act(out)
         out = self.fusion_conv(out)
-
         return x + out
 
 
 class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
-                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1)):
+                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), use_attention=True, branch_depth=3):
         super().__init__()
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1, padding=0, padding_mode='circular'))
         layers.append(nn.LeakyReLU(0.01))
 
-        # 🌟 智能路由：根据新增的开关决定使用哪种块
         for _ in range(num_hidden_layers):
             if use_multi_kernel:
-                layers.append(MultiScaleResBlock(hidden_channels, kernel_sizes=multi_kernel_sizes, dilations=multi_kernel_dilations))
+                layers.append(MultiScaleResBlock(hidden_channels, kernel_sizes=multi_kernel_sizes,
+                                                 dilations=multi_kernel_dilations, branch_depth=branch_depth))
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
+
+        if use_attention:
+            layers.append(CorrelationLatticeAttention(hidden_channels))
 
         layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1, stride=1, padding=0, padding_mode='circular'))
         self.net = nn.Sequential(*layers)
@@ -251,58 +329,85 @@ class FlowModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.L = config['L']
-        self.coupling_layers = config['coupling_layers']
+        self.cnn_layers = config['cnn_coupling_layers']
+        self.attn_layers = config.get('attn_coupling_layers', 0)
+        self.total_layers = self.cnn_layers + self.attn_layers
+
         self.register_buffer('base_mask', create_checkerboard_mask(self.L))
+        self.context_nets = nn.ModuleList()
 
-        # 将参数从 config 解包并向下透传
-        self.context_nets = nn.ModuleList([
-            ConvContextNet(
-                hidden_channels=config['hidden_channels'],
-                num_hidden_layers=config['hidden_layers'],
-                kernel_size=config['kernel_size'],
-                use_multi_kernel=config.get('use_multi_kernel', False),
-                multi_kernel_sizes=config.get('multi_kernel_sizes', (3, 5, 7)),
-                multi_kernel_dilations=config.get('multi_kernel_dilations', (1, 1, 1)),
-            ) for _ in range(self.coupling_layers)
-        ])
+        for _ in range(self.cnn_layers):
+            self.context_nets.append(
+                ConvContextNet(
+                    hidden_channels=config['hidden_channels'],
+                    num_hidden_layers=config['hidden_layers'],
+                    kernel_size=config['kernel_size'],
+                    use_multi_kernel=config.get('use_multi_kernel', False),
+                    multi_kernel_sizes=config.get('multi_kernel_sizes', (3, 3)),
+                    multi_kernel_dilations=config.get('multi_kernel_dilations', (1, 2)),
+                    use_attention=False,
+                    branch_depth=config.get('branch_depth', 3)
+                )
+            )
 
-        arch_info = f"多尺度组合: {config.get('multi_kernel_sizes')}" if config.get(
-            'use_multi_kernel') else f"单核: {config['kernel_size']}"
-        print(
-            f"当前模型耦合层：{self.coupling_layers} 通道数：{config['hidden_channels']}， 隐藏层：{config['hidden_layers']}, 卷积配置：{arch_info}")
+        for _ in range(self.attn_layers):
+            self.context_nets.append(
+                GlobalAttentionContextNet(
+                    hidden_channels=config['hidden_channels']
+                )
+            )
 
-    def forward(self, z, iteration=None):
+        if config.get('use_multi_kernel', False):
+            arch_info = f"多尺度: {config.get('multi_kernel_sizes')} | 空洞率: {config.get('multi_kernel_dilations')}"
+        else:
+            arch_info = f"单核: {config['kernel_size']}"
+
+        print("=" * 70)
+        print(f"🌟 物理流模型 (UV-IR Decoupling 架构) 初始化完毕！")
+        print(f"👉 总耦合层数: {self.total_layers} 层 (特征通道数: {config['hidden_channels']})")
+        print(f"   │")
+        print(f"   ├─ [UV 物理] 纯 CNN 局域重整化: 前 {self.cnn_layers} 层")
+        print(f"   │  ├─ 内部隐藏层 (ResBlocks): {config['hidden_layers']} 层 / 耦合层")
+        print(f"   │  └─ 卷积网络配置: {arch_info} | 分支深度: {config.get('branch_depth', 3)}")
+        print(f"   │")
+        print(f"   └─ [IR 物理] 纯 Attention 宏观接管: 后 {self.attn_layers} 层")
+        print(f"      └─ 内部拓扑架构: 标准特征抽取映射 (QKV 解耦，纯全局关联)")
+        print("=" * 70)
+
+    def forward(self, z, clamp_min=None, clamp_max=None):
         phi = z
         log_det_jacobian = 0
-        for i in range(self.coupling_layers):
+
+        for i in range(self.total_layers):
             current_mask = self.base_mask if i % 2 == 0 else (1.0 - self.base_mask)
             phi_frozen = current_mask * phi
             st_out = self.context_nets[i](phi_frozen)
+
             s_out = st_out[:, 0:1, :, :]
             t_out = st_out[:, 1:2, :, :]
 
-            # ================= 🌟 智能状态感知退火逻辑 =================
             if self.training:
-                # 【训练阶段】：需要保护措施
-                if iteration is not None:
-                    if iteration < 5000:
-                        s_out = torch.clamp(s_out, min=-6.0, max=3.0)
-                    elif iteration < 10000:
-                        s_out = torch.clamp(s_out, min=-10.0, max=5.0)
-                    # iteration >= 15000 视为完全放开
-                else:
-                    # 万一你外部漏传了 iteration，给个保底兜底
-                    s_out = torch.clamp(s_out, min=-8.0, max=4.0)
-            else:
-                # 【生成系综阶段】：model.eval() 被调用，彻底解除封印！
-                # 不做任何 clamp 操作，让模型完全自由发挥它学到的真实物理分布
-                pass
-                # =========================================================
+                s_out = asymmetric_soft_clamp(s_out, min_val=clamp_min, max_val=clamp_max)
+                t_out = torch.clamp(t_out, min=-15.0, max=15.0)
 
             update_mask = 1.0 - current_mask
             phi = phi_frozen + update_mask * (phi * torch.exp(s_out) + t_out)
             log_det_jacobian += torch.sum(update_mask * s_out, dim=(1, 2, 3))
+
         return phi, log_det_jacobian
+
+
+def asymmetric_soft_clamp(x, min_val=None, max_val=None):
+    if min_val is None or max_val is None:
+        return x
+
+    pos_scale = max_val
+    neg_scale = abs(min_val)
+
+    pos_val = pos_scale * torch.tanh(x / pos_scale)
+    neg_val = neg_scale * torch.tanh(x / neg_scale)
+
+    return torch.where(x >= 0, pos_val, neg_val)
 
 
 # ==========================================
@@ -310,12 +415,10 @@ class FlowModel(nn.Module):
 # ==========================================
 def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path'], resume=True,
           checkpoint_path=CONFIG['checkpoint_path']):
-    # 实例化流模型 (传入整个 CONFIG 方便管理)
     model = FlowModel(CONFIG).to(device)
-
     prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
-    if CONFIG['double precision']:
+    if CONFIG['double_precision']:
         model = model.double()
         prior = prior.double()
 
@@ -325,7 +428,8 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
     scheduler = None
     if CONFIG.get('use_scheduler', True):
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['iterations'], eta_min=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['iterations'],
+                                                               eta_min=CONFIG['scheduler_min'])
 
     history_loss = []
     best_loss = float('inf')
@@ -339,32 +443,25 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-            if CONFIG.get('double precision', False):
+            if CONFIG.get('double_precision', False):
                 for state in optimizer.state.values():
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor): state[k] = v.double()
 
-            # ================= 🌟 智能学习率与调度器恢复逻辑 =================
             if CONFIG.get('use_scheduler', True):
-                # 【模式 A】启用 Scheduler：恢复 Scheduler 的记忆，由它全权接管学习率
                 if scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint[
                     'scheduler_state_dict'] is not None:
                     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             else:
-                # 【模式 B】关闭 Scheduler：强制用你当前 CONFIG['lr'] 的设置，覆盖断点里的旧学习率
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = CONFIG['lr']
-            # ================================================================
 
             start_iteration = checkpoint['iteration'] + 1
-
             if 'history_loss' in checkpoint: history_loss = checkpoint['history_loss']
 
-            # === 🌟 核心修复区：安全恢复历史 best_loss ===
             if 'best_loss' in checkpoint:
                 best_loss = checkpoint['best_loss']
             elif len(history_loss) > 0:
-                # 兼容你的旧版断点：如果没存 best_loss，就从历史记录里大海捞针找出最低点
                 best_loss = min(history_loss)
 
             print(f"恢复成功！将从第 {start_iteration} 步继续训练。")
@@ -375,10 +472,18 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
     for iteration in range(start_iteration, CONFIG['iterations'] + 1):
         optimizer.zero_grad()
         z, log_p_z = prior.sample(CONFIG['batch_size'])
-        phi, log_det_J = model(z, iteration)
+
+        if iteration < 3000:
+            c_min, c_max = -4.0, 0.5
+        elif iteration < 8000:
+            c_min, c_max = -5.0, 0.8
+        else:
+            c_min, c_max = None, None
+
+        phi, log_det_J = model(z, c_min, c_max)
+
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
-        # 🌟 新增这一行：限制梯度的最大范数，防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         if scheduler is not None: scheduler.step()
@@ -404,17 +509,15 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
 
         if iteration % 1000 == 0:
             np.save(loss_save_path, np.array(history_loss))
-            if iteration % 5000 == 0:
-                # 兼容里程碑文件名的生成
-                k_str_in_loop = f"multi_kernels_{'_'.join(map(str, CONFIG['multi_kernel_sizes']))}" if CONFIG.get(
-                    'use_multi_kernel') else f"kernel_size_{CONFIG['kernel_size']}"
-                milestone_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_{k_str_in_loop}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
-                torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
-                            'best_loss': best_loss, 'history_loss': history_loss}, milestone_path)
+            milestone_path = f"prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
+
+            torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
+                        'best_loss': best_loss, 'history_loss': history_loss}, milestone_path)
     print("训练结束！")
 
+
 if __name__ == "__main__":
-    if CONFIG.get('double precision', False): torch.set_default_dtype(torch.float64)
+    if CONFIG.get('double_precision', False): torch.set_default_dtype(torch.float64)
     train()

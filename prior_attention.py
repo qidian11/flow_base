@@ -24,13 +24,16 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
+    # 🌟 提取 attention 标识
+    attn_str = f"attn_{config.get('use_attention', False)}"
+
     # 根据新增加的开关，决定搜索哪种架构的文件
     if config.get('use_multi_kernel', False):
         sizes_str = '_'.join(map(str, config['multi_kernel_sizes']))
         dilations_str = '_'.join(map(str, config.get('multi_kernel_dilations', (1, 1, 1))))
-        k_str = f"multi_kernels_{sizes_str}_dilations_{dilations_str}"
+        k_str = f"multi_kernels_{sizes_str}_dilations_{dilations_str}_{attn_str}"
     else:
-        k_str = f"kernel_size_{config['kernel_size']}"
+        k_str = f"kernel_size_{config['kernel_size']}_{attn_str}"
 
     base_pattern = (
         f"prior_cnn_res_model_double_precision_*_"
@@ -76,28 +79,36 @@ CONFIG = {
     'm_sq': -4.0,
     'lam': 5.113,
     'batch_size': 512,
-    'lr': 3e-6,
-    'use_scheduler': False,
+    'lr': 1e-3,
+    'use_scheduler': True,
+    'scheduler_min': 3e-6,
     'iterations': 40000,
     'coupling_layers': 14,
     'kernel_size': 14,  # 原汁原味的旧参数，如果你关掉多核开关，网络就会用这个
     'hidden_layers': 4,
-    'hidden_channels': 128,
+    'hidden_channels': 144,
     'double precision': False,
 
     # === 新增字段 (控制多尺度卷积) ===
     'use_multi_kernel': True,  # 设为 False 则退回你的原版单架构网络
-    'multi_kernel_sizes': (1, 3, 5),  # 这里自定义多尺度的大小
-    'multi_kernel_dilations': (1, 1, 1), # <--- 在这里任意修改每个核的空洞率！
+    'multi_kernel_sizes': (1, 3),  # 这里自定义多尺度的大小
+    'multi_kernel_dilations': (1, 1), # <--- 在这里任意修改每个核的空洞率！
+
+    # use_attention
+    'use_attention': True
 }
 
-# 动态生成文件名中的标识（加入 dilations）
+# ==========================================
+# 动态生成文件名中的标识（加入 dilations 和 attention）
+# ==========================================
+attn_str = f"attn_{CONFIG.get('use_attention', False)}"
+
 if CONFIG.get('use_multi_kernel', False):
     sizes_str = '_'.join(map(str, CONFIG['multi_kernel_sizes']))
     dilations_str = '_'.join(map(str, CONFIG.get('multi_kernel_dilations', (1, 1, 1))))
-    k_str = f"multi_kernels_{sizes_str}_dilations_{dilations_str}"
+    k_str = f"multi_kernels_{sizes_str}_dilations_{dilations_str}_{attn_str}"
 else:
-    k_str = f"kernel_size_{CONFIG['kernel_size']}"
+    k_str = f"kernel_size_{CONFIG['kernel_size']}_{attn_str}"
 
 
 # 文件名生成
@@ -134,6 +145,40 @@ def create_checkerboard_mask(L):
     return mask_2d.view(1, 1, L, L).float()
 
 
+class LatticeSelfAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        # 使用 1x1 卷积直接完成隐空间的线性映射，提取 Q, K, V
+        # 这里的 channels 对应你网络中的 hidden_channels (比如 128)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+        # 缩放因子 \sqrt{d_k}
+        self.scale = channels ** -0.5
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        N = H * W  # 序列长度，对于 L=14，N=196
+
+        # 1. 提取 Q, K, V: [B, 3C, H, W] -> [B, 3, C, N]
+        qkv = self.qkv(x).view(B, 3, C, N)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # 分别为 [B, C, N]
+
+        # 2. 计算注意力权重相似度矩阵: Q^T @ K
+        # q.transpose(-2, -1) 相当于 [B, N, C]
+        # attn: [B, N, C] @ [B, C, N] -> [B, N, N]
+        attn = torch.einsum('bcn,bcm->bnm', q, k) * self.scale
+        attn = torch.softmax(attn, dim=-1)  # 对每一行归一化
+
+        # 3. 加权求和 Value: attn @ V^T
+        # v: [B, C, N] -> out: [B, C, N]
+        out = torch.einsum('bcm,bnm->bcn', v, attn)
+
+        # 4. 还原为晶格空间形状并加上残差连接
+        out = out.view(B, C, H, W)
+        return x + self.proj(out)
+
 # --- 你的原版单分支网络 (已修复 padding 越界 bug) ---
 class ResBlock(nn.Module):
     def __init__(self, channels, kernel_size=3):
@@ -153,7 +198,6 @@ class ResBlock(nn.Module):
         return x + self.act3(self.conv3(self.act2(self.conv2(self.act1(self.conv1(x))))))
 
 
-# --- 新的多尺度网络 ---
 class MultiScaleResBlock(nn.Module):
     def __init__(self, channels, kernel_sizes=(3, 5, 7), dilations=(1, 1, 1)):
         super().__init__()
@@ -193,7 +237,7 @@ class MultiScaleResBlock(nn.Module):
 
 class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
-                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1)):
+                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), use_attention=True):
         super().__init__()
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1, padding=0, padding_mode='circular'))
@@ -205,6 +249,11 @@ class ConvContextNet(nn.Module):
                 layers.append(MultiScaleResBlock(hidden_channels, kernel_sizes=multi_kernel_sizes, dilations=multi_kernel_dilations))
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
+
+        # 2. 引入长程自注意力机制 (提取全局物理关联)
+        if use_attention:
+            layers.append(LatticeSelfAttention(hidden_channels))
+            layers.append(nn.LeakyReLU(0.01))  # 可以加一个激活
 
         layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1, stride=1, padding=0, padding_mode='circular'))
         self.net = nn.Sequential(*layers)
@@ -325,7 +374,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
     scheduler = None
     if CONFIG.get('use_scheduler', True):
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['iterations'], eta_min=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['iterations'], eta_min=CONFIG['scheduler_min'])
 
     history_loss = []
     best_loss = float('inf')

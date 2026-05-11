@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from prior_cnn_multi_kernel import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
+from attention_plus import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
 # from prior_cnn_net import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
 
 
@@ -51,6 +51,7 @@ def produce_ensemble(model, prior, total_n=100000, batch_size=1024):
     print(f"正在并行生成 {total_n} 个提案...")
     with torch.no_grad():
         for _ in range(0, total_n, batch_size):
+            print(f'第{_}轮，总共{total_n//batch_size}轮')
             current_batch = min(batch_size, total_n - len(all_phis))
 
             # 1. 从自由场先验中采样
