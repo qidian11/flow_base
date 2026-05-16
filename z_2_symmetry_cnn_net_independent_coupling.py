@@ -25,7 +25,7 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    layer_str = f"layers_{config['cnn_coupling_layers']}cnn_{config['attn_coupling_layers']}attn"
+    layer_str = f"layers_{config['cnn_coupling_layers']}cnn"
     depth_str = f"depth_{config.get('branch_depth', 3)}"
 
     if config.get('use_multi_kernel', False):
@@ -36,8 +36,8 @@ def auto_find_latest_checkpoint(config):
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
     base_pattern = (
-        f"prior_cnn_res_model_double_precision_*_"
-        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'] + config['attn_coupling_layers'])}_"
+        f"z_2_symmetry_cnn_res_independent_coupling_model_double_precision_*_"
+        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
@@ -78,27 +78,24 @@ CONFIG = {
     'm_sq': -4.0,
     'lam': 5.113,
     'batch_size': 512,
-    'lr': 1e-4,
+    'lr': 1e-3,
     'use_scheduler': True,
-    'scheduler_min': 5e-6,
-    'iterations': 30000,
+    'scheduler_min': 1e-5,
+    'iterations': 20000,
 
-    'cnn_coupling_layers': 12,
-    'attn_coupling_layers': 0,
-
+    'cnn_coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 256,
+    'hidden_channels': 64,
     'double_precision': False,
-
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
     'multi_kernel_dilations': (1,),
 }
 
-total_coupling_layers = CONFIG['cnn_coupling_layers'] + CONFIG['attn_coupling_layers']
-layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn_{CONFIG['attn_coupling_layers']}attn"
+total_coupling_layers = CONFIG['cnn_coupling_layers']
+layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn"
 depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
 
 if CONFIG.get('use_multi_kernel', False):
@@ -108,10 +105,10 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-save_path = f"best_prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+save_path = f"best_z_2_symmetry_cnn_res_independent_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"z_2_symmetry_cnn_res_independent_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_z_2_symmetry_cnn_res_independent_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_z_2_symmetry_cnn_res_independent_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -154,84 +151,6 @@ class LeakyTanh(nn.Module):
         return self.alpha * x + self.beta * torch.tanh(x)
 # ==========================================
 
-# ==========================================
-# 🌟 全新重构：标准非对称全局特征注意力机制
-# ==========================================
-class CorrelationLatticeAttention(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.GroupNorm(1, channels, affine=False)
-
-        # 内部特征提取维度 (可以设为与 channels 相等)
-        self.head_dim = channels
-
-        # 1. 特征提取矩阵 (W_Q, W_K, W_V)
-        # 用 1x1 卷积实现物理空间的独立映射，替代你原来的 x_unit
-        self.q_proj = nn.Conv2d(channels, self.head_dim, kernel_size=1)
-        self.k_proj = nn.Conv2d(channels, self.head_dim, kernel_size=1)
-        self.v_proj = nn.Conv2d(channels, self.head_dim, kernel_size=1)
-
-        # 2. 特征反馈矩阵 (W_O)
-        # 将聚合后的全局关联特征，翻译回原物理通道空间
-        self.out_proj = nn.Conv2d(self.head_dim, channels, kernel_size=1)
-
-        # 保证初始残差恒等映射
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
-
-        # 3. 保方差的融合门控
-        self.gamma_logit = nn.Parameter(torch.tensor(-5.0))
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        N = H * W
-
-        # 预处理：标准化特征流形
-        x_norm = self.norm(x)
-
-        # 提取特征并展平空间以进行全局路由
-        # q: (B, D, N)  |  k: (B, D, N)  |  v: (B, D, N)
-        q = self.q_proj(x_norm).view(B, self.head_dim, N)
-        k = self.k_proj(x_norm).view(B, self.head_dim, N)
-        v = self.v_proj(x_norm).view(B, self.head_dim, N)
-
-        # 计算非对称相似度 (用数学上严谨的 1/sqrt(d_k) 缩放替代手工 beta)
-        # 此时 bnm 含义：第 n 个格点的查询，去匹配第 m 个格点的特征
-        attn = torch.einsum('bdn,bdm->bnm', q, k) / math.sqrt(self.head_dim)
-        attn = torch.softmax(attn, dim=-1)
-
-        # 聚合全局特征 V
-        # bdm 代表 m 格点的特征，bnm 代表分配权重，聚合回 bdn (n 格点的新特征)
-        out = torch.einsum('bdm,bnm->bdn', v, attn)
-
-        # 折叠回物理空间形状
-        out = out.view(B, self.head_dim, H, W)
-
-        # 使用 W_O 矩阵进行特征反馈
-        out = self.out_proj(out)
-
-        # 动态计算融合系数 gamma
-        gamma = torch.sigmoid(self.gamma_logit)
-
-        return (1.0 - gamma) * x + gamma * out
-
-
-class GlobalAttentionContextNet(nn.Module):
-    def __init__(self, hidden_channels=256):
-        super().__init__()
-        self.in_conv = nn.Conv2d(1, hidden_channels, kernel_size=1, bias=False)
-        self.act = LeakyTanh()
-        self.attention = CorrelationLatticeAttention(hidden_channels)
-        self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1, bias=False)
-
-        nn.init.zeros_(self.out_conv.weight)
-        # nn.init.zeros_(self.out_conv.bias)
-
-    def forward(self, x):
-        h = self.act(self.in_conv(x))
-        h = self.attention(h)
-        return self.out_conv(h)
-
 
 class ResBlock(nn.Module):
     def __init__(self, channels, kernel_size=3):
@@ -246,6 +165,12 @@ class ResBlock(nn.Module):
         self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=padding,
                                padding_mode='circular', bias=False)
         self.act3 = LeakyTanh()
+
+        # 🌟 模块自治：自己管好自己的初始化
+        # 🌟 改进：将残差块的最后一层严格置零
+        nn.init.normal_(self.conv1.weight, mean=0, std=0.01)
+        nn.init.normal_(self.conv2.weight, mean=0, std=0.01)
+        nn.init.zeros_(self.conv3.weight)
 
     def forward(self, x):
         return x + self.act3(self.conv3(self.act2(self.conv2(self.act1(self.conv1(x))))))
@@ -271,6 +196,12 @@ class MultiScaleResBlock(nn.Module):
 
         num_branches = len(kernel_sizes)
         self.fusion_conv = nn.Conv2d(channels * num_branches, channels, kernel_size=1, bias=False)
+        # 🌟 模块自治：分支卷积给 0.01，出口融合卷积给 0
+        for branch in self.branches:
+            for m in branch:
+                if isinstance(m, nn.Conv2d):
+                    nn.init.normal_(m.weight, mean=0, std=0.01)
+        nn.init.zeros_(self.fusion_conv.weight)
 
     def forward(self, x):
         outs = [branch(x) for branch in self.branches]
@@ -281,7 +212,7 @@ class MultiScaleResBlock(nn.Module):
 
 class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
-                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), use_attention=True, branch_depth=3):
+                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1,
@@ -296,21 +227,18 @@ class ConvContextNet(nn.Module):
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
 
-        if use_attention:
-            layers.append(CorrelationLatticeAttention(hidden_channels))
-
         layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1,
                                 stride=1, padding=0, padding_mode='circular',bias=False)
                       )
         self.net = nn.Sequential(*layers)
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, mean=0, std=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        # 头部给予 0.01 小权重防激活饱和
+        nn.init.normal_(self.net[0].weight, mean=0, std=0.01)
+
+        # 尾部给予绝对的 0.0，对外保证完美恒等映射
         nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x):
         return self.net(x)
@@ -348,8 +276,7 @@ class FlowModel(nn.Module):
         super().__init__()
         self.L = config['L']
         self.cnn_layers = config['cnn_coupling_layers']
-        self.attn_layers = config.get('attn_coupling_layers', 0)
-        self.total_layers = self.cnn_layers + self.attn_layers
+        self.total_layers = self.cnn_layers
 
         self.register_buffer('base_mask', create_checkerboard_mask(self.L))
         self.context_nets = nn.ModuleList()
@@ -364,15 +291,7 @@ class FlowModel(nn.Module):
                     use_multi_kernel=config.get('use_multi_kernel', False),
                     multi_kernel_sizes=config.get('multi_kernel_sizes', (3, 3)),
                     multi_kernel_dilations=config.get('multi_kernel_dilations', (1, 2)),
-                    use_attention=False,
                     branch_depth=config.get('branch_depth', 3)
-                )
-            )
-
-        for _ in range(self.attn_layers):
-            self.context_nets.append(
-                GlobalAttentionContextNet(
-                    hidden_channels=config['hidden_channels']
                 )
             )
 
@@ -386,11 +305,8 @@ class FlowModel(nn.Module):
         print(f"👉 总耦合层数: {self.total_layers} 层 (特征通道数: {config['hidden_channels']})")
         print(f"   │")
         print(f"   ├─ [UV 物理] 纯 CNN 局域重整化: 前 {self.cnn_layers} 层")
-        print(f"   │  ├─ 内部隐藏层 (ResBlocks): {config['hidden_layers']} 层 / 耦合层")
-        print(f"   │  └─ 卷积网络配置: {arch_info} | 分支深度: {config.get('branch_depth', 3)}")
-        print(f"   │")
-        print(f"   └─ [IR 物理] 纯 Attention 宏观接管: 后 {self.attn_layers} 层")
-        print(f"      └─ 内部拓扑架构: 标准特征抽取映射 (QKV 解耦，纯全局关联)")
+        print(f"      ├─ 内部隐藏层 (ResBlocks): {config['hidden_layers']} 层 / 耦合层")
+        print(f"      └─ 卷积网络配置: {arch_info} | 分支深度: {config.get('branch_depth', 3)}")
         print("=" * 70)
 
     def forward(self, z, clamp_min=None, clamp_max=None):
@@ -398,31 +314,29 @@ class FlowModel(nn.Module):
         log_det_jacobian = 0
 
         for i, net in enumerate(self.context_nets):
-            for step in range(2):
-                current_mask = self.base_mask if step == 0 else (1.0 - self.base_mask)
-                phi_frozen = current_mask * phi
+            current_mask = self.base_mask if (i % 2) == 0 else (1.0 - self.base_mask)
+            phi_frozen = current_mask * phi
 
-                # 🌟 只跑一次！速度翻倍！
-                st_out = net(phi_frozen)
+            st_out = net(phi_frozen)
 
-                # h_s 和 h_t 现在都是严格的奇函数
-                h_s = st_out[:, 0:1, :, :]
-                h_t = st_out[:, 1:2, :, :]
+            # h_s 和 h_t 现在都是严格的奇函数
+            h_s = st_out[:, 0:1, :, :]
+            h_t = st_out[:, 1:2, :, :]
 
-                # 🌟 奇偶转换魔术
-                # 奇 x 奇 + 偶(常数) = 绝对的偶函数
-                s_out = h_s * torch.tanh(phi_frozen) + self.s_biases[i]
+            # 🌟 奇偶转换魔术
+            # 奇 x 奇 + 偶(常数) = 绝对的偶函数
+            s_out = h_s * torch.tanh(phi_frozen) + self.s_biases[i]
 
-                # 奇函数本身 = 奇函数
-                t_out = h_t
+            # 奇函数本身 = 奇函数
+            t_out = h_t
 
-                if self.training:
-                    s_out = asymmetric_soft_clamp(s_out, min_val=clamp_min, max_val=clamp_max)
-                    t_out = torch.clamp(t_out, min=-15.0, max=15.0)
+            if self.training:
+                s_out = asymmetric_soft_clamp(s_out, min_val=clamp_min, max_val=clamp_max)
+                t_out = torch.clamp(t_out, min=-15.0, max=15.0)
 
-                update_mask = 1.0 - current_mask
-                phi = phi_frozen + update_mask * (phi * torch.exp(s_out) + t_out)
-                log_det_jacobian += torch.sum(update_mask * s_out, dim=(1, 2, 3))
+            update_mask = 1.0 - current_mask
+            phi = phi_frozen + update_mask * (phi * torch.exp(s_out) + t_out)
+            log_det_jacobian += torch.sum(update_mask * s_out, dim=(1, 2, 3))
 
         return phi, log_det_jacobian
 

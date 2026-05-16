@@ -10,7 +10,7 @@ def load_trained_model(checkpoint_path):
         CONFIG
     ).to(device)
 
-    if CONFIG.get('double precision', False):
+    if CONFIG.get('double_precision', False):
         model = model.double()
 
     # map_location 确保在不同硬件环境下顺利加载
@@ -123,7 +123,7 @@ if __name__ == "__main__":
     # PATH = 'best_prior_cnn_res_model_double_precision_True_14_coupling_layers_32_hidden_layers_6_hidden_channels_16_iterations_45000.pt'
     print(f"模型加载路径: {PATH}")
 
-    if CONFIG.get('double precision', False):
+    if CONFIG.get('double_precision', False):
         torch.set_default_dtype(torch.float64)
         print('double precision: True')
 
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     prior_m_sq = abs(CONFIG['m_sq'])
     prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=prior_m_sq).to(device)
 
-    if CONFIG.get('double precision', False):
+    if CONFIG.get('double_precision', False):
         prior = prior.double()
 
     # 生成物理集成 (例如 100,000 个构型)
