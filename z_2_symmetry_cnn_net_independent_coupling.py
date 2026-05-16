@@ -83,7 +83,7 @@ CONFIG = {
     'scheduler_min': 1e-5,
     'iterations': 20000,
 
-    'cnn_coupling_layers': 6,
+    'cnn_coupling_layers': 12,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
@@ -227,7 +227,7 @@ class ConvContextNet(nn.Module):
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
 
-        layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1,
+        layers.append(nn.Conv2d(hidden_channels, 3, kernel_size=1,
                                 stride=1, padding=0, padding_mode='circular',bias=False)
                       )
         self.net = nn.Sequential(*layers)
@@ -236,7 +236,12 @@ class ConvContextNet(nn.Module):
         nn.init.normal_(self.net[0].weight, mean=0, std=0.01)
 
         # 尾部给予绝对的 0.0，对外保证完美恒等映射
-        nn.init.zeros_(self.net[-1].weight)
+        # 🌟 修复: 打破 s 通道的零初始化死锁
+        # 给负责 h_s1 和 h_s2 的前两个通道极小的随机噪声，提供非零梯度启动
+        nn.init.normal_(self.net[-1].weight[:2], mean=0, std=0.1)
+        # 负责 h_t 的第三个通道依然严格置零，保证初始阶段空间平移守恒
+        nn.init.zeros_(self.net[-1].weight[2:])
+
         if self.net[-1].bias is not None:
             nn.init.zeros_(self.net[-1].bias)
 
@@ -309,7 +314,7 @@ class FlowModel(nn.Module):
         print(f"      └─ 卷积网络配置: {arch_info} | 分支深度: {config.get('branch_depth', 3)}")
         print("=" * 70)
 
-    def forward(self, z, clamp_min=None, clamp_max=None):
+    def forward(self, z, s_clamp_min=None, s_clamp_max=None, t_clamp_min=None, t_clamp_max=None):
         phi = z
         log_det_jacobian = 0
 
@@ -318,25 +323,30 @@ class FlowModel(nn.Module):
             phi_frozen = current_mask * phi
 
             st_out = net(phi_frozen)
+            # 🌟 提取三个通道，它们全都是严格的奇函数！
+            h_s1 = st_out[:, 0:1, :, :]
+            h_s2 = st_out[:, 1:2, :, :]
+            h_t = st_out[:, 2:3, :, :]
 
-            # h_s 和 h_t 现在都是严格的奇函数
-            h_s = st_out[:, 0:1, :, :]
-            h_t = st_out[:, 1:2, :, :]
-
-            # 🌟 奇偶转换魔术
-            # 奇 x 奇 + 偶(常数) = 绝对的偶函数
-            s_out = h_s * torch.tanh(phi_frozen) + self.s_biases[i]
+            # 🌟 真正的终极奇偶魔术：奇特征 x 奇特征 = 偶特征！
+            # 两个特征都依赖于周围的冻结点，在更新点上绝不为 0！
+            s_out = h_s1 * h_s2 + self.s_biases[i]
 
             # 奇函数本身 = 奇函数
             t_out = h_t
 
             if self.training:
-                s_out = asymmetric_soft_clamp(s_out, min_val=clamp_min, max_val=clamp_max)
-                t_out = torch.clamp(t_out, min=-15.0, max=15.0)
+                s_out = asymmetric_soft_clamp(s_out, min_val=s_clamp_min, max_val=s_clamp_max)
+                t_out = clamp_t(t_out, min_val=t_clamp_min, max_val=t_clamp_max)
 
             update_mask = 1.0 - current_mask
-            phi = phi_frozen + update_mask * (phi * torch.exp(s_out) + t_out)
-            log_det_jacobian += torch.sum(update_mask * s_out, dim=(1, 2, 3))
+            # 🌟 更新 1: 严格遵循论文 Eq. 10 的生成映射 (Prior -> Data)
+            # 公式: phi_b = (z_b - t) ⊙ exp(-s)
+            phi = phi_frozen + update_mask * ((phi - t_out) * torch.exp(-s_out))
+
+            # 🌟 更新 2: 修正雅可比行列式的对数
+            # 由于 ∂phi / ∂z = exp(-s)，因此 log_det 是 -s
+            log_det_jacobian += torch.sum(update_mask * (-s_out), dim=(1, 2, 3))
 
         return phi, log_det_jacobian
 
@@ -352,6 +362,12 @@ def asymmetric_soft_clamp(x, min_val=None, max_val=None):
     neg_val = neg_scale * torch.tanh(x / neg_scale)
 
     return torch.where(x >= 0, pos_val, neg_val)
+
+
+def clamp_t(x, min_val=None, max_val=None):
+    if min_val is None or max_val is None:
+        return x
+    return torch.clamp(x, min_val, max_val)
 
 
 # ==========================================
@@ -377,6 +393,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
 
     history_loss = []
     best_loss = float('inf')
+    ema_loss = None
     start_iteration = 1
 
     if resume:
@@ -417,14 +434,18 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
         optimizer.zero_grad()
         z, log_p_z = prior.sample(CONFIG['batch_size'])
 
+        # 🌟 更新 3: 配合 exp(-s) 翻转 Clamp 限制区间
         if iteration < 3000:
-            c_min, c_max = -4.0, 0.5
+            s_c_min, s_c_max = -0.5, 4.0  # 以前是 -4.0, 0.5
+            t_c_min, t_c_max = -15.0, 15.0
         elif iteration < 8000:
-            c_min, c_max = -5.0, 0.8
+            s_c_min, s_c_max = -0.8, 5.0  # 以前是 -5.0, 0.8
+            t_c_min, t_c_max = -15.0, 15.0
         else:
-            c_min, c_max = None, None
+            s_c_min, s_c_max = None, None
+            t_c_min, t_c_max = None, None
 
-        phi, log_det_J = model(z, c_min, c_max)
+        phi, log_det_J = model(z, s_c_min, s_c_max, t_c_min, t_c_max)
 
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
@@ -435,17 +456,26 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
         loss_val = loss.item()
         history_loss.append(loss_val)
 
+        # 🌟 修复：计算 Loss 的指数移动平均 (EMA)，滤除蒙特卡洛采样噪声
+        if ema_loss is None:
+            ema_loss = loss_val
+        else:
+            # 0.95 的动量意味着参考过去约 20 个 batch (10000+ 个样本) 的真实物理表现
+            ema_loss = 0.95 * ema_loss + 0.05 * loss_val
+
         if iteration % 100 == 0:
+            # 打印时同时显示瞬时 Loss 和真实的 EMA Loss
             print(
-                f"迭代 {iteration:6d}/{CONFIG['iterations']} | Loss: {loss.item():.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                f"迭代 {iteration:6d}/{CONFIG['iterations']} | 瞬时 Loss: {loss_val:.4f} | 平滑 Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
                         'best_loss': best_loss, 'history_loss': history_loss}, checkpoint_path)
 
-        if loss_val < best_loss and iteration >= 10000:
-            best_loss = loss_val
-            print(f"🌟 第 {iteration}步发现更优模型！当前最佳 Loss: {best_loss:.4f}，正在更新 best 断点...")
+        # 🌟 修复：用剔除噪声后的 ema_loss 去竞选 Best Model
+        if ema_loss < best_loss and iteration >= 10000:
+            best_loss = ema_loss
+            print(f"🌟 第 {iteration}步发现更优全局模型！当前最佳平滑 Loss: {best_loss:.4f}，正在更新 best 断点...")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': best_loss,
@@ -453,7 +483,7 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
 
         if iteration % 1000 == 0:
             np.save(loss_save_path, np.array(history_loss))
-            milestone_path = f"prior_cnn_res_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
+            milestone_path = f"z_2_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
 
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
