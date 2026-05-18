@@ -87,7 +87,7 @@ CONFIG = {
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 64,
+    'hidden_channels': 16,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -214,7 +214,15 @@ class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
                  multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
+
+        # 对s通道的输出再卷积一次conv(h_s**2)
+        self.s_exit_conv = nn.Conv2d(1, 1, kernel_size=3, padding=1, padding_mode='circular', bias=True)
+        # 将出口卷积的权重和偏置严格初始化为 0
+        nn.init.zeros_(self.s_exit_conv.weight)
+        nn.init.zeros_(self.s_exit_conv.bias)
+
         layers = []
+
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1,
                                 padding=0, padding_mode='circular', bias=False)
                       )
@@ -227,26 +235,30 @@ class ConvContextNet(nn.Module):
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
 
-        layers.append(nn.Conv2d(hidden_channels, 3, kernel_size=1,
+        layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1,
                                 stride=1, padding=0, padding_mode='circular',bias=False)
                       )
         self.net = nn.Sequential(*layers)
 
-        # 头部给予 0.01 小权重防激活饱和
-        nn.init.normal_(self.net[0].weight, mean=0, std=0.01)
+        # 头部给予 0.1 小权重防激活饱和
+        nn.init.normal_(self.net[0].weight, mean=0, std=0.1)
 
-        # 尾部给予绝对的 0.0，对外保证完美恒等映射
-        # 🌟 修复: 打破 s 通道的零初始化死锁
-        # 给负责 h_s1 和 h_s2 的前两个通道极小的随机噪声，提供非零梯度启动
-        nn.init.normal_(self.net[-1].weight[:2], mean=0, std=0.1)
-        # 负责 h_t 的第三个通道依然严格置零，保证初始阶段空间平移守恒
-        nn.init.zeros_(self.net[-1].weight[2:])
+        # 1. 尾部负责 h_s (通道 0) 的部分：必须给健康的噪声，保证 h_s**2 不为 0！
+        nn.init.normal_(self.net[-1].weight[0:1], mean=0, std=0.1)
+
+        # 2. 尾部负责 h_t (通道 1) 的部分：绝对为 0，保证初始恒等映射和奇函数对称性
+        nn.init.zeros_(self.net[-1].weight[1:2])
 
         if self.net[-1].bias is not None:
             nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x):
-        return self.net(x)
+        out = self.net(x)
+        h_s = out[:, 0:1, :, :]
+        h_t = out[:, 1:2, :, :]
+        h_s= self.s_exit_conv(h_s**2)
+        out = torch.cat([h_s, h_t], dim=1)
+        return out
 
 
 # ==========================================
@@ -323,17 +335,9 @@ class FlowModel(nn.Module):
             phi_frozen = current_mask * phi
 
             st_out = net(phi_frozen)
-            # 🌟 提取三个通道，它们全都是严格的奇函数！
-            h_s1 = st_out[:, 0:1, :, :]
-            h_s2 = st_out[:, 1:2, :, :]
-            h_t = st_out[:, 2:3, :, :]
-
-            # 🌟 真正的终极奇偶魔术：奇特征 x 奇特征 = 偶特征！
-            # 两个特征都依赖于周围的冻结点，在更新点上绝不为 0！
-            s_out = h_s1 * h_s2 + self.s_biases[i]
-
-            # 奇函数本身 = 奇函数
-            t_out = h_t
+            # 🌟 提取两个通道，s_out是严格的偶函数，t_out是严格的奇函数！
+            s_out = st_out[:, 0:1, :, :]
+            t_out = st_out[:, 1:2, :, :]
 
             if self.training:
                 s_out = asymmetric_soft_clamp(s_out, min_val=s_clamp_min, max_val=s_clamp_max)
@@ -420,6 +424,9 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             start_iteration = checkpoint['iteration'] + 1
             if 'history_loss' in checkpoint: history_loss = checkpoint['history_loss']
 
+            if 'ema_loss' in checkpoint:
+                ema_loss = checkpoint['ema_loss']
+
             if 'best_loss' in checkpoint:
                 best_loss = checkpoint['best_loss']
             elif len(history_loss) > 0:
@@ -470,7 +477,8 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
-                        'best_loss': best_loss, 'history_loss': history_loss}, checkpoint_path)
+                        'best_loss': best_loss, 'history_loss': history_loss,
+                        'ema_loss': ema_loss,}, checkpoint_path)
 
         # 🌟 修复：用剔除噪声后的 ema_loss 去竞选 Best Model
         if ema_loss < best_loss and iteration >= 10000:
@@ -478,8 +486,9 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             print(f"🌟 第 {iteration}步发现更优全局模型！当前最佳平滑 Loss: {best_loss:.4f}，正在更新 best 断点...")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': best_loss,
-                        'best_loss': best_loss, 'history_loss': history_loss}, save_path)
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
+                        'best_loss': best_loss, 'history_loss': history_loss,
+                        'ema_loss': ema_loss,}, save_path)
 
         if iteration % 1000 == 0:
             np.save(loss_save_path, np.array(history_loss))
@@ -488,7 +497,8 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
-                        'best_loss': best_loss, 'history_loss': history_loss}, milestone_path)
+                        'best_loss': best_loss, 'history_loss': history_loss,
+                        'ema_loss': ema_loss,}, milestone_path)
     print("训练结束！")
 
 

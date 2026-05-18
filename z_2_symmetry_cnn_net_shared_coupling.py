@@ -87,7 +87,7 @@ CONFIG = {
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 64,
+    'hidden_channels': 16,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -117,14 +117,27 @@ CONFIG['phi_ensemble_save_path'] = phi_ensemble_save_path
 
 
 # ==========================================
-# 2. 标量场理论的 Action 计算
+# 2. 标量场理论的 Action 计算 (已修复：卷积替代 roll)
 # ==========================================
 def compute_action(phi):
-    phi_up = torch.roll(phi, shifts=-1, dims=2)
-    phi_down = torch.roll(phi, shifts=1, dims=2)
-    phi_left = torch.roll(phi, shifts=-1, dims=3)
-    phi_right = torch.roll(phi, shifts=1, dims=3)
-    laplacian = 4 * phi - phi_up - phi_down - phi_left - phi_right
+    # 动态获取 phi 的设备和精度，完美适配双精度迁移
+    device = phi.device
+    dtype = phi.dtype
+
+    # 构建固定的 2D 拉普拉斯算子卷积核 [out_channels=1, in_channels=1, H=3, W=3]
+    laplacian_kernel = torch.tensor([[
+        [0.0, -1.0, 0.0],
+        [-1.0, 4.0, -1.0],
+        [0.0, -1.0, 0.0]
+    ]], device=device, dtype=dtype).unsqueeze(1)
+
+    # 手动进行 circular 扩充
+    phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
+
+    # 算力起飞：用单次卷积完成所有的邻居计算
+    laplacian = F.conv2d(phi_padded, laplacian_kernel)
+
+    # 计算 Action 密度
     action_density = phi * laplacian + CONFIG['m_sq'] * (phi ** 2) + CONFIG['lam'] * (phi ** 4)
     return torch.sum(action_density, dim=(1, 2, 3))
 
@@ -213,6 +226,13 @@ class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
                  multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
+
+        # 对s通道的输出再卷积一次conv(h_s**2)
+        self.s_exit_conv = nn.Conv2d(1, 1, kernel_size=3, padding=1, padding_mode='circular', bias=True)
+        # 将出口卷积的权重和偏置严格初始化为 0
+        nn.init.zeros_(self.s_exit_conv.weight)
+        nn.init.zeros_(self.s_exit_conv.bias)
+
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1,
                                 padding=0, padding_mode='circular', bias=False)
@@ -226,26 +246,30 @@ class ConvContextNet(nn.Module):
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
 
-        layers.append(nn.Conv2d(hidden_channels, 3, kernel_size=1,
+        layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1,
                                 stride=1, padding=0, padding_mode='circular',bias=False)
                       )
         self.net = nn.Sequential(*layers)
 
-        # 头部给予 0.01 小权重防激活饱和
-        nn.init.normal_(self.net[0].weight, mean=0, std=0.01)
+        # 头部给予 0.1 小权重防激活饱和
+        nn.init.normal_(self.net[0].weight, mean=0, std=0.1)
 
+        # 1. 尾部负责 h_s (通道 0) 的部分：必须给健康的噪声，保证 h_s**2 不为 0！
+        nn.init.normal_(self.net[-1].weight[0:1], mean=0, std=0.1)
 
-        # 🌟 修复: 打破 s 通道的零初始化死锁
-        # 给负责 h_s1 和 h_s2 的前两个通道极小的随机噪声，提供非零梯度启动
-        nn.init.normal_(self.net[-1].weight[:2], mean=0, std=0.1)
-        # 负责 h_t 的第三个通道依然严格置零，保证初始阶段空间平移守恒
-        nn.init.zeros_(self.net[-1].weight[2:])
+        # 2. 尾部负责 h_t (通道 1) 的部分：绝对为 0，保证初始恒等映射和奇函数对称性
+        nn.init.zeros_(self.net[-1].weight[1:2])
 
         if self.net[-1].bias is not None:
             nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x):
-        return self.net(x)
+        out = self.net(x)
+        h_s = out[:, 0:1, :, :]
+        h_t = out[:, 1:2, :, :]
+        h_s = self.s_exit_conv(h_s ** 2)
+        out = torch.cat([h_s, h_t], dim=1)
+        return out
 
 
 # ==========================================
@@ -284,7 +308,6 @@ class FlowModel(nn.Module):
 
         self.register_buffer('base_mask', create_checkerboard_mask(self.L))
         self.context_nets = nn.ModuleList()
-        self.s_biases = nn.ParameterList([nn.Parameter(torch.zeros(1)) for _ in range(self.total_layers)])
 
         for _ in range(self.cnn_layers):
             self.context_nets.append(
@@ -305,7 +328,7 @@ class FlowModel(nn.Module):
             arch_info = f"单核: {config['kernel_size']}"
 
         print("=" * 70)
-        print(f"🌟 物理流模型 (UV-IR Decoupling 架构) 初始化完毕！")
+        print(f"🌟 物理流模型初始化完毕！")
         print(f"👉 总耦合层数: {self.total_layers} 层 (特征通道数: {config['hidden_channels']})")
         print(f"   │")
         print(f"   ├─ [UV 物理] 纯 CNN 局域重整化: 前 {self.cnn_layers} 层")
@@ -323,17 +346,10 @@ class FlowModel(nn.Module):
                 phi_frozen = current_mask * phi
 
                 st_out = net(phi_frozen)
-                # 🌟 提取三个通道，它们全都是严格的奇函数！
-                h_s1 = st_out[:, 0:1, :, :]
-                h_s2 = st_out[:, 1:2, :, :]
-                h_t = st_out[:, 2:3, :, :]
+                # 🌟 提取两个通道，s_out是严格的偶函数，t_out是严格的奇函数！
+                s_out = st_out[:, 0:1, :, :]
+                t_out = st_out[:, 1:2, :, :]
 
-                # 🌟 真正的终极奇偶魔术：奇特征 x 奇特征 = 偶特征！
-                # 两个特征都依赖于周围的冻结点，在更新点上绝不为 0！
-                s_out = h_s1 * h_s2 + self.s_biases[i]
-
-                # 奇函数本身 = 奇函数
-                t_out = h_t
 
                 if self.training:
                     s_out = asymmetric_soft_clamp(s_out, min_val=s_clamp_min, max_val=s_clamp_max)
@@ -412,13 +428,28 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             if CONFIG.get('use_scheduler', True):
                 if scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint[
                     'scheduler_state_dict'] is not None:
+                    # 1. 先加载断点中保存的 scheduler 状态（包含当前的 step 等）
                     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+                    # 🌟 修复：强行覆写 T_max 为当前的 CONFIG['iterations']
+                    scheduler.T_max = CONFIG['iterations']
+
+                    # 🌟 进阶保险：如果你在断点恢复时顺手改了 CONFIG['lr']
+                    # 需要把优化器和 scheduler 里的基础学习率也一并修正
+                    for param_group in optimizer.param_groups:
+                        if 'initial_lr' in param_group:
+                            param_group['initial_lr'] = CONFIG['lr']
+                    if hasattr(scheduler, 'base_lrs'):
+                        scheduler.base_lrs = [CONFIG['lr'] for _ in scheduler.base_lrs]
             else:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = CONFIG['lr']
 
             start_iteration = checkpoint['iteration'] + 1
             if 'history_loss' in checkpoint: history_loss = checkpoint['history_loss']
+            # 新增：从断点中恢复平滑 Loss，如果不存在（比如第一次跑旧代码的构型）则保持 None
+            if 'ema_loss' in checkpoint:
+                ema_loss = checkpoint['ema_loss']
 
             if 'best_loss' in checkpoint:
                 best_loss = checkpoint['best_loss']
@@ -469,8 +500,11 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
                 f"迭代 {iteration:6d}/{CONFIG['iterations']} | 瞬时 Loss: {loss_val:.4f} | 平滑 Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
-                        'best_loss': best_loss, 'history_loss': history_loss}, checkpoint_path)
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                        'loss': loss_val,
+                        'best_loss': best_loss,
+                        'history_loss': history_loss,
+                        'ema_loss': ema_loss,}, checkpoint_path)
 
         # 🌟 修复：用剔除噪声后的 ema_loss 去竞选 Best Model
         if ema_loss < best_loss and iteration >= 10000:
@@ -478,8 +512,11 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             print(f"🌟 第 {iteration}步发现更优全局模型！当前最佳平滑 Loss: {best_loss:.4f}，正在更新 best 断点...")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': best_loss,
-                        'best_loss': best_loss, 'history_loss': history_loss}, save_path)
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                        'loss': loss_val,
+                        'best_loss': best_loss,
+                        'history_loss': history_loss,
+                        'ema_loss': ema_loss,}, save_path)
 
         if iteration % 1000 == 0:
             np.save(loss_save_path, np.array(history_loss))
@@ -488,7 +525,9 @@ def train(save_path=CONFIG['save_path'], loss_save_path=CONFIG['loss_save_path']
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
-                        'best_loss': best_loss, 'history_loss': history_loss}, milestone_path)
+                        'best_loss': best_loss,
+                        'history_loss': history_loss,
+                        'ema_loss': ema_loss,}, milestone_path)
     print("训练结束！")
 
 
