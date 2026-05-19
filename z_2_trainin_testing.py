@@ -71,14 +71,14 @@ CONFIG = {
     'use_scheduler': True,
     'scheduler_min': 5e-6,
     'iterations': 35000,  # 提高总步数，靠 70% 接受率机制来提前早停
-    'warmup_steps': 8000.0, # 退火步数，小于8000步会对参数进行数值限制
+    'warmup_steps': 3000.0, # 退火步数，小于8000步会对参数进行数值限制
     'target_acc_ratio': 0.78,
 
     'cnn_coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 256,
+    'hidden_channels': 64,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -147,6 +147,7 @@ class ResBlock(nn.Module):
     # 移除了 num_groups 参数，因为不再使用 GroupNorm
     def __init__(self, channels, kernel_size=3):
         super().__init__()
+        self.channels = channels
         padding = kernel_size // 2
 
         # 1. 第一层：WeightNorm(Conv) -> Act
@@ -176,8 +177,10 @@ class ResBlock(nn.Module):
 
     def forward(self, x):
         # 结构变得极度干净：直接作用于物理场的绝对振幅
-        out = self.act1(self.conv1(x))
-        out = self.act2(self.conv2(out))
+        # 核心：强行除以 math.sqrt(channels) 或直接除以 channels，将方差暴力压回 1 的量级
+        scale = math.sqrt(self.channels)
+        out = self.act1(self.conv1(x)/ scale)
+        out = self.act2(self.conv2(out)/ scale)
         out = self.conv3(out)
         return x + out
 
@@ -186,6 +189,7 @@ class MultiScaleResBlock(nn.Module):
     # 同样移除了 num_groups 参数
     def __init__(self, channels, kernel_sizes=(3, 5, 7), dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
+        self.channels = channels  # 记录通道数用于方差缩放
         assert len(kernel_sizes) == len(dilations), "卷积核数量和空洞率数量必须严格匹配！"
         self.branches = nn.ModuleList()
 
@@ -212,6 +216,9 @@ class MultiScaleResBlock(nn.Module):
         nn.init.zeros_(self.fusion_conv.weight)
 
     def forward(self, x):
+        # 核心防爆技巧：方差缩放因子。
+        # 为什么是平方根？因为独立同分布变量求和后，标准差是以 sqrt(n) 的速度增长的。
+        scale = math.sqrt(self.channels)
         outs = []
         for branch in self.branches:
             out = x
@@ -220,7 +227,7 @@ class MultiScaleResBlock(nn.Module):
                 conv_layer = branch[i]
                 act_layer = branch[i + 1]
 
-                out = act_layer(conv_layer(out))
+                out = act_layer(conv_layer(out)/ scale)
             outs.append(out)
 
         # 沿通道维度拼接所有分支的结果
@@ -236,9 +243,6 @@ class ConvContextNet(nn.Module):
     def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
                  multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
-        self.s_exit_conv = nn.Conv2d(1, 1, kernel_size=3, padding=1, padding_mode='circular', bias=True)
-        nn.init.zeros_(self.s_exit_conv.weight)
-        nn.init.zeros_(self.s_exit_conv.bias)
 
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1, padding=0, bias=False))
@@ -251,19 +255,52 @@ class ConvContextNet(nn.Module):
             else:
                 layers.append(ResBlock(hidden_channels, kernel_size=kernel_size))
 
-        layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=1, stride=1, padding=0, bias=False))
+        # 让主干网络直接输出 hidden_channels，不做通道压缩
+        layers.append(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, stride=1, padding=0, bias=False))
         self.net = nn.Sequential(*layers)
 
+        # 🌟 根据切分比例，重新定义出口层的输入通道
+        c = hidden_channels // 4
+
+        # s_exit 接收 1/4 的通道 (h_even 的维度)
+        self.s_exit_conv = nn.Conv2d(c, 1, kernel_size=1, stride=1, bias=True)
+
+        # t_exit 接收剩下的 1/2 的独立通道
+        self.t_exit_conv = nn.Conv2d(hidden_channels - 2 * c, 1, kernel_size=1, stride=1, bias=False)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
         nn.init.normal_(self.net[0].weight, mean=0, std=0.1)
-        nn.init.normal_(self.net[-1].weight[0:1], mean=0, std=0.1)
-        nn.init.zeros_(self.net[-1].weight[1:2])
-        if self.net[-1].bias is not None: nn.init.zeros_(self.net[-1].bias)
+        nn.init.normal_(self.net[-1].weight, mean=0, std=0.1)
+
+        # 出口层严格清零，保证初始梯度满血复活！
+        nn.init.zeros_(self.s_exit_conv.weight)
+        nn.init.zeros_(self.s_exit_conv.bias)
+        nn.init.zeros_(self.t_exit_conv.weight)
 
     def forward(self, x):
         out = self.net(x)
-        h_s = self.s_exit_conv(torch.tanh(out[:, 0:1, :, :]) ** 2)
-        h_t = out[:, 1:2, :, :]
-        return torch.cat([h_s, h_t], dim=1)
+
+        # 🌟 破除耦合的核心：通道硬切分
+        c = out.shape[1] // 4
+
+        # 独立通道 1 和 2：专属用于构造偶函数 s
+        h_s1 = out[:, 0:c, :, :]
+        h_s2 = out[:, c:2 * c, :, :]
+
+        # 独立通道 3：专属用于直接输出奇函数 t
+        h_t_base = out[:, 2 * c:, :, :]
+
+        # 分支 1：计算偶函数 s
+        h_even = h_s1 * torch.tanh(h_s2)
+        s_out = self.s_exit_conv(h_even)
+
+        # 分支 2：计算奇函数 t (完全不依赖 h_s1 和 h_s2)
+        t_out = self.t_exit_conv(h_t_base)
+
+        return torch.cat([s_out, t_out], dim=1)
 
 
 # ==========================================
@@ -356,12 +393,19 @@ class FlowModel(nn.Module):
                 st_out = net(phi_frozen)
                 s_out, t_out = st_out[:, 0:1, :, :], st_out[:, 1:2, :, :]
 
-                # 1. 必须是 training 模式
-                # 2. 传入了 current_step 且确实还没达到 warmup_steps (8000步)
-                # 过了 8000 步，哪怕是训练模式也彻底不裁剪！
-                if self.training and (progress is not None and progress < 1.0):
-                    s_out = asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
-                    t_out = torch.clamp(t_out, self.t_bounds[0], self.t_bounds[1])
+                # 🌟 核心改造：完全消除动态 Python if 分支
+                # self.training 不会引发问题，因为 PyTorch 自动为 train 和 eval 编译两张独立的静态图
+                if self.training and progress is not None:
+                    # 1. 此时 progress 是一个 Tensor。生成一个标量布尔掩码，并扩展维度以支持广播
+                    is_warmup = (progress < 1.0).view(1, 1, 1, 1)
+
+                    # 2. 正常计算裁剪结果
+                    s_clamped = asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
+                    t_clamped = torch.clamp(t_out, self.t_bounds[0], self.t_bounds[1])
+
+                    # 3. 使用 torch.where 让底层 Kernel 自动选择（彻底消灭 Graph Break）
+                    s_out = torch.where(is_warmup, s_clamped, s_out)
+                    t_out = torch.where(is_warmup, t_clamped, t_out)
 
                 update_mask = 1.0 - current_mask
                 phi = phi_frozen + update_mask * ((phi - t_out) * torch.exp(-s_out))
@@ -494,13 +538,13 @@ def train():
             last_epoch=start_iteration - 1 if start_iteration > 1 else -1
         )
 
-    # if hasattr(torch, 'compile') and device.type == 'cuda':
-    #     # 强制指定 fullgraph=False 允许标准的常数分支拍平，
-    #     # 并提前切换状态让编译器做好双图缓存准备
-    #     model.train()
-    #     compiled_model = torch.compile(model)
-    # else:
-    #     compiled_model = model
+    if hasattr(torch, 'compile') and device.type == 'cuda':
+        # 强制指定 fullgraph=False 允许标准的常数分支拍平，
+        # 并提前切换状态让编译器做好双图缓存准备
+        model.train()
+        compiled_model = torch.compile(model)
+    else:
+        compiled_model = model
 
 
 
@@ -511,10 +555,16 @@ def train():
 
         # 🌟 动态边界退火：前 15000 步平滑放开限制，之后完全解除
         warmup_steps = CONFIG['warmup_steps']
-        progress = min(iteration / warmup_steps, 1.0)
-        model.step_warmup(progress)
+        progress_val = min(iteration / warmup_steps, 1.0)
 
-        phi, log_det_J = model(z, progress)
+        # 这个操作在图外进行，不影响编译
+        model.step_warmup(progress_val)
+
+        # 🌟 将 progress 打包成 Tensor 传入编译后的模型
+        progress_tensor = torch.tensor(progress_val, device=device, dtype=dtype)
+
+        # 使用编译后的模型
+        phi, log_det_J = compiled_model(z, progress_tensor)
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
 
@@ -553,7 +603,7 @@ def train():
         if iteration >= 10000 and iteration % 5000 == 0:
             print(f"\n{'=' * 50}")
             print(f"🚀 [迭代 {iteration}] 触发 MCMC 在线验证 (样本量: 10000)...")
-            acc_rate = run_mcmc_evaluation(model, prior, total_n=10000, batch_size=CONFIG['batch_size'],)
+            acc_rate = run_mcmc_evaluation(compiled_model, prior, total_n=10000, batch_size=CONFIG['batch_size'],)
             print(f"📊 当前物理接受率: {acc_rate:.2%}")
             print(f"{'=' * 50}\n")
 
