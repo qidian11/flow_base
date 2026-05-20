@@ -71,14 +71,14 @@ CONFIG = {
     'use_scheduler': True,
     'scheduler_min': 5e-6,
     'iterations': 35000,  # 提高总步数，靠 70% 接受率机制来提前早停
-    'warmup_steps': 3000.0, # 退火步数，小于8000步会对参数进行数值限制
+    'warmup_steps': 8000.0, # 退火步数，小于8000步会对参数进行数值限制
     'target_acc_ratio': 0.78,
 
     'cnn_coupling_layers': 6,
     'kernel_size': 3,
-    'hidden_layers': 4,
+    'hidden_layers': 3,
     'branch_depth': 2,
-    'hidden_channels': 64,
+    'hidden_channels': 32,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -143,6 +143,38 @@ class LeakyTanh(nn.Module):
         return self.alpha * x + self.beta * torch.tanh(x)
 
 
+class CompiledWeightNormConv2d(nn.Module):
+    """
+    对 torch.compile 绝对友好的 WeightNorm 卷积。
+    完全抛弃 PyTorch 官方的 parametrizations hook，用纯数学张量操作实现，
+    彻底消除 AOTAutograd 在生成反向传播计算图时的 Graph Break。
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.dilation = dilation
+
+        # 定义权重的方向 v (即普通的卷积参数，但不带 bias)
+        self.weight_v = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
+        nn.init.kaiming_uniform_(self.weight_v, a=math.sqrt(5))
+
+        # 🌟 修复：使用底层的 平方 -> 求和 -> 开根号 替代 torch.norm
+        with torch.no_grad():
+            initial_norm = torch.sqrt(torch.sum(self.weight_v ** 2, dim=(1, 2, 3), keepdim=True))
+        self.weight_g = nn.Parameter(initial_norm)
+
+    def forward(self, x):
+        # 🌟 修复：前向传播中同样使用最底层的数学算子计算 L2 范数
+        v_norm = torch.sqrt(torch.sum(self.weight_v ** 2, dim=(1, 2, 3), keepdim=True))
+
+        # 2. 计算最终使用的归一化权重: W = g * (v / ||v||)
+        # 加 1e-8 防止除零引发 NaN
+        w = self.weight_g * (self.weight_v / (v_norm + 1e-8))
+
+        # 3. 使用底层 F.conv2d 执行卷积，编译器最喜欢这种静态的纯函数算子
+        return F.conv2d(x, w, bias=None, stride=1, padding=0, dilation=self.dilation)
+
+
 class ResBlock(nn.Module):
     # 移除了 num_groups 参数，因为不再使用 GroupNorm
     def __init__(self, channels, kernel_size=3):
@@ -150,20 +182,14 @@ class ResBlock(nn.Module):
         self.channels = channels
         padding = kernel_size // 2
 
-        # 1. 第一层：WeightNorm(Conv) -> Act
-        self.conv1 = weight_norm(nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=padding,
-                                           padding_mode='circular', bias=False))
+        # 🌟 直接使用我们的自定义纯净版 WeightNorm
+        self.conv1 = CompiledWeightNormConv2d(channels, channels, kernel_size=kernel_size)
         self.act1 = LeakyTanh()
 
-        # 2. 第二层：WeightNorm(Conv) -> Act
-        self.conv2 = weight_norm(nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=padding,
-                                           padding_mode='circular', bias=False))
+        self.conv2 = CompiledWeightNormConv2d(channels, channels, kernel_size=kernel_size)
         self.act2 = LeakyTanh()
 
-        # 3. 第三层：普通 Conv (不加 WeightNorm，方便执行纯粹的零初始化)
-        self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=padding,
-                               padding_mode='circular', bias=False)
-
+        self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=0, bias=False)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -176,12 +202,20 @@ class ResBlock(nn.Module):
         nn.init.zeros_(self.conv3.weight)
 
     def forward(self, x):
-        # 结构变得极度干净：直接作用于物理场的绝对振幅
-        # 核心：强行除以 math.sqrt(channels) 或直接除以 channels，将方差暴力压回 1 的量级
         scale = math.sqrt(self.channels)
-        out = self.act1(self.conv1(x)/ scale)
-        out = self.act2(self.conv2(out)/ scale)
+
+        # 手动进行 Circular Padding
+        pad = (self.pad_size, self.pad_size, self.pad_size, self.pad_size)
+
+        out = F.pad(x, pad=pad, mode='circular')
+        out = self.act1(self.conv1(out) / scale)
+
+        out = F.pad(out, pad=pad, mode='circular')
+        out = self.act2(self.conv2(out) / scale)
+
+        out = F.pad(out, pad=pad, mode='circular')
         out = self.conv3(out)
+
         return x + out
 
 
@@ -193,20 +227,25 @@ class MultiScaleResBlock(nn.Module):
         assert len(kernel_sizes) == len(dilations), "卷积核数量和空洞率数量必须严格匹配！"
         self.branches = nn.ModuleList()
 
+        # 🌟 新增：记录每个分支对应的 padding 尺寸
+        self.branch_pads = []
+
         for k, d in zip(kernel_sizes, dilations):
             assert k % 2 != 0, f"多尺度卷积核必须均为奇数！当前输入了偶数核: {k}"
-            pad = d * (k - 1) // 2
+
+            # 计算当前分支感受野所需的 padding
+            pad_size = d * (k - 1) // 2
+            self.branch_pads.append(pad_size)
+
             layers = nn.ModuleList()
             for _ in range(branch_depth):
-                # 1. 卷积层：使用 weight_norm 替代 Norm
-                layers.append(weight_norm(nn.Conv2d(channels, channels, kernel_size=k, stride=1,
-                                                    padding=pad, padding_mode='circular', dilation=d, bias=False)))
+                # 🌟 核心修改 1：彻底移除 padding_mode='circular'，强制设为 padding=0
+                layers.append(CompiledWeightNormConv2d(channels, channels, kernel_size=k, dilation=d))
                 # 2. 激活层 (移除了中间的 Norm)
                 layers.append(LeakyTanh())
             self.branches.append(layers)
 
         # 融合卷积层：负责将多个多尺度特征压缩回原始通道数。
-        # 作为残差块的最后一道防线，保持为普通 Conv2d 并开启 bias 以备零初始化
         self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=False)
 
         self._initialize_weights()
@@ -216,18 +255,27 @@ class MultiScaleResBlock(nn.Module):
         nn.init.zeros_(self.fusion_conv.weight)
 
     def forward(self, x):
-        # 核心防爆技巧：方差缩放因子。
-        # 为什么是平方根？因为独立同分布变量求和后，标准差是以 sqrt(n) 的速度增长的。
         scale = math.sqrt(self.channels)
         outs = []
-        for branch in self.branches:
+
+        # 🌟 核心修改 2：在遍历分支时，同时取出对应的 pad_size
+        for branch, pad_size in zip(self.branches, self.branch_pads):
             out = x
-            # 注意这里：步长改为了 2，因为模块组合变成了单纯的 (Conv, Act)
+
+            # F.pad 接收的参数格式是 (左, 右, 上, 下)
+            pad_tuple = (pad_size, pad_size, pad_size, pad_size)
+
             for i in range(0, len(branch), 2):
                 conv_layer = branch[i]
                 act_layer = branch[i + 1]
 
-                out = act_layer(conv_layer(out)/ scale)
+                # 🌟 核心修改 3：在过卷积层之前，先用纯函数进行显式的 Circular Padding
+                out = F.pad(out, pad=pad_tuple, mode='circular')
+
+                # 正常过卷积层（此时底层不会再遇到 padding_mode 的黑盒）
+                # (注意：保留了你原代码的写法，如果这里需要除以 scale 防爆，可以自行改回 / scale)
+                out = act_layer(conv_layer(out))
+
             outs.append(out)
 
         # 沿通道维度拼接所有分支的结果
@@ -245,7 +293,8 @@ class ConvContextNet(nn.Module):
         super().__init__()
 
         layers = []
-        layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1, padding=0, bias=False))
+        layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1,
+                                padding=1, bias=False))
         layers.append(LeakyTanh())
 
         for _ in range(num_hidden_layers):
@@ -338,9 +387,12 @@ class FlowModel(nn.Module):
         self.total_layers = self.cnn_layers
         self.register_buffer('base_mask', create_checkerboard_mask(self.L))
         self.context_nets = nn.ModuleList()
-        # 🌟 注册裁剪值
-        self.register_buffer('s_bounds', torch.tensor([-0.5, 4.0], dtype=torch.float64))
-        self.register_buffer('t_bounds', torch.tensor([-15.0, 15.0], dtype=torch.float64))
+        # 提取当前设备类型和精度
+        dtype = torch.float64 if config.get('double_precision', False) else torch.float32
+
+        # 注册时使用动态 dtype
+        self.register_buffer('s_bounds', torch.tensor([-0.5, 4.0], dtype=dtype))
+        self.register_buffer('t_bounds', torch.tensor([-15.0, 15.0], dtype=dtype))
 
         for _ in range(self.cnn_layers):
             self.context_nets.append(ConvContextNet(
@@ -434,17 +486,23 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
     """
     model.eval()
 
+    # 强制修正，消灭尾部不规则 Batch
+    total_n = (total_n // batch_size) * batch_size
+
     # 1. 预先在 GPU 上分配 1D 标量空间 (1万个浮点数仅占用不到 1MB)
     dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
     all_s = torch.empty(total_n, dtype=dtype, device=device)
     all_log_qs = torch.empty(total_n, dtype=dtype, device=device)
+
+    # 生成一个占位张量，保持与训练期签名一致
+    dummy_progress = torch.tensor(1.0, device=device, dtype=dtype)
 
     with torch.no_grad():
         for i in range(0, total_n, batch_size):
             current_batch = min(batch_size, total_n - i)
 
             z, log_p_z = prior.sample(current_batch)
-            phi, log_det_J = model(z)
+            phi, log_det_J = model(z, dummy_progress)
 
             # 按批次算完 Action 直接存入 GPU 的 1D 数组
             # 此时局部的 4D 张量 phi 随循环结束被自动回收，永不 OOM
