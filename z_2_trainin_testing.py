@@ -76,9 +76,9 @@ CONFIG = {
 
     'cnn_coupling_layers': 6,
     'kernel_size': 3,
-    'hidden_layers': 3,
+    'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 32,
+    'hidden_channels': 192,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -249,10 +249,18 @@ class MultiScaleResBlock(nn.Module):
         self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=False)
 
         self._initialize_weights()
+        # 🌟 核心修改 1：不直接训练 alpha，而是训练不受限的 raw_alpha
+        self.raw_alpha = nn.Parameter(torch.zeros(1))
+        # 设定 alpha 的绝对物理上限，比如 1.0 (允许残差分支最大提供 1 倍的信号)
+        # 你可以根据对流模型的预期将其设为 0.5 或 2.0
+        self.max_alpha = 1.0
 
     def _initialize_weights(self):
         # 🌟 流模型核心技巧：零初始化 (Zero-init for Flow Residuals)
-        nn.init.zeros_(self.fusion_conv.weight)
+        # nn.init.zeros_(self.fusion_conv.weight)
+        # ✅ 改为标准的 Kaiming 均匀分布初始化 (PyTorch 默认)，
+        # 或者为了保守起见，用一个小方差的正态分布
+        nn.init.normal_(self.fusion_conv.weight, mean=0.0, std=0.01)
 
     def forward(self, x):
         scale = math.sqrt(self.channels)
@@ -272,8 +280,7 @@ class MultiScaleResBlock(nn.Module):
                 # 🌟 核心修改 3：在过卷积层之前，先用纯函数进行显式的 Circular Padding
                 out = F.pad(out, pad=pad_tuple, mode='circular')
 
-                # 正常过卷积层（此时底层不会再遇到 padding_mode 的黑盒）
-                # (注意：保留了你原代码的写法，如果这里需要除以 scale 防爆，可以自行改回 / scale)
+                # 🌟
                 out = act_layer(conv_layer(out))
 
             outs.append(out)
@@ -284,7 +291,12 @@ class MultiScaleResBlock(nn.Module):
         # 仅经过 1x1 卷积融合即可，不再经过 fusion_norm
         out = self.fusion_conv(fused)
 
-        return x + out
+        # 🌟 核心修改 2：用 tanh 将 raw_alpha 强行压在 [-max_alpha, max_alpha] 之间
+        # 初始时 raw_alpha = 0，tanh(0) = 0，完美保持了恒等映射的初始化
+        # 训练后期就算 raw_alpha 跑到 1000，safe_alpha 也只会平滑地逼近 1.0
+        safe_alpha = self.max_alpha * torch.tanh(self.raw_alpha)
+
+        return x + safe_alpha * out
 
 
 class ConvContextNet(nn.Module):
