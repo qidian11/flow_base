@@ -35,28 +35,28 @@ def auto_find_latest_checkpoint(config):
     拥有自动跳过损坏文件，并执行降级回退的机制。
     搜索优先级：健康的 latest > 健康的 best > 健康的 里程碑
     """
+    # 🌟 新增：提取分支深度参数
+    depth_str = f"depth_{config.get('branch_depth', 3)}"
+
     # 提取通用的核心匹配字符串 (忽略双精度开关和迭代次数的差异)
     base_pattern = (
         f"prior_cnn_res_model_double_precision_*_"
         f"{config['L']}_coupling_layers_{config['coupling_layers']}_"
-        f"kernel_size_{CONFIG['kernel_size']}_"
+        f"kernel_size_{config['kernel_size']}_{depth_str}_"  # 🌟 插入 depth_str
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
     )
 
-    # 辅助函数：根据前缀获取按修改时间从新到老排序的文件列表
     def get_sorted_files(prefix):
         files = glob.glob(prefix + base_pattern)
         return sorted(files, key=os.path.getmtime, reverse=True)
 
-    # ================= 1. 优先尝试找 latest =================
     for file in get_sorted_files("latest_"):
         if is_valid_checkpoint(file):
             return file
         else:
             print(f"⚠️ 警告: 检测到损坏的 latest 断点并已自动跳过 -> {file}")
 
-    # ================= 2. 找不到/全坏了，退而求其次找 best =================
     for file in get_sorted_files("best_"):
         if is_valid_checkpoint(file):
             print(f"🔄 未找到可用的 latest，已自动回退到最新的 best 断点 -> {file}")
@@ -64,17 +64,13 @@ def auto_find_latest_checkpoint(config):
         else:
             print(f"⚠️ 警告: 检测到损坏的 best 断点并已自动跳过 -> {file}")
 
-    # ================= 3. 终极保底：找你每5000步存的里程碑 =================
-    # 里程碑文件没有 latest_ 或 best_ 前缀
     for file in get_sorted_files(""):
         filename = os.path.basename(file)
-        # 排除掉已经被 glob 匹配到的 latest_ 和 best_ 文件
         if not filename.startswith(("latest_", "best_")):
             if is_valid_checkpoint(file):
                 print(f"🔄 best 也不可用，已自动回退到里程碑断点 -> {file}")
                 return file
 
-    # 4. 彻底弹尽粮绝，只能从头开始
     return None
 
 
@@ -101,19 +97,25 @@ CONFIG = {
     'm_sq': -4.0,  # m^2 (质量的平方，破缺相)
     'lam': 5.113,  # lambda (耦合常数)
     'batch_size': 1024,  # 批大小
-    'lr': 2e-5,  # 学习率
-    'use_scheduler': False, # <--- 新增开关，方便以后随时切回退火
+    'lr': 1e-3,  # 学习率
+    'use_scheduler': True, # <--- 新增开关，方便以后随时切回退火
     'iterations': 25000,  # 训练迭代次数
-    'coupling_layers': 14,
-    'kernel_size': 5,
-    'hidden_layers': 6,  # 实际上是6*3
+    'coupling_layers': 12,
+    'kernel_size': 3,
+    'hidden_layers': 4,  # 实际上是6*3
+    'branch_depth': 2,  # 🌟 新增：ResBlock内部的卷积层数
     'hidden_channels': 16,
     'double precision': False,
 }
-save_path = f"best_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_loss_history_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+# 🌟 新增：拼接带有 depth 的公用后缀
+depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
+base_suffix = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_{depth_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}"
+
+save_path = f"best_{base_suffix}.pt"
+loss_save_path = f"{base_suffix}_loss_history.npy"
+checkpoint_path = f"latest_{base_suffix}.pt"
+phi_ensemble_save_path = f"phi_ensemble_{base_suffix}.npz"
+
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
 CONFIG['checkpoint_path'] = checkpoint_path
@@ -148,30 +150,34 @@ def create_checkerboard_mask(L):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, channels, kernel_size=3):
+    def __init__(self, channels, kernel_size=3, branch_depth=3):
         super().__init__()
         # 动态计算 padding
         pad = kernel_size // 2
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular')
-        self.act1 = nn.LeakyReLU(0.01)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular')
-        self.act2 = nn.LeakyReLU(0.01)
-        self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular')
-        self.act3 = nn.LeakyReLU(0.01)
+
+        # 🌟 修改：使用动态网络容器堆叠指定数量的 卷积+激活层
+        layers = []
+        for _ in range(branch_depth):
+            layers.append(
+                nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular'))
+            layers.append(nn.LeakyReLU(0.01))
+
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x):
-        return x + self.act3(self.conv3(self.act2(self.conv2(self.act1(self.conv1(x))))))
+        # 🌟 现在的残差连接极其简洁
+        return x + self.block(x)
 
 
 class ConvContextNet(nn.Module):
-    def __init__(self, hidden_channels=8, num_hidden_layers=4,kernel_size=3):
+    def __init__(self, hidden_channels=8, num_hidden_layers=4,kernel_size=3, branch_depth=3):
         super().__init__()
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=1, stride=1, padding=0, padding_mode='circular'))
         layers.append(nn.LeakyReLU(0.01))
 
         for _ in range(num_hidden_layers):
-            layers.append(ResBlock(hidden_channels,kernel_size=kernel_size))
+            layers.append(ResBlock(hidden_channels,kernel_size=kernel_size,branch_depth=branch_depth))
         # 修复2：动态计算最后一层的 padding
         pad = kernel_size // 2
         layers.append(nn.Conv2d(hidden_channels, 2, kernel_size=kernel_size, stride=1, padding=pad, padding_mode='circular'))
@@ -255,7 +261,8 @@ class FlowModel(nn.Module):
             ConvContextNet(
                 hidden_channels=config['hidden_channels'],
                 num_hidden_layers=config['hidden_layers'],
-                kernel_size=config.get('kernel_size', 3)
+                kernel_size=config.get('kernel_size', 3),
+                branch_depth=config.get('branch_depth', 3)
             ) for _ in range(self.coupling_layers)
         ])
         print(
@@ -280,10 +287,9 @@ class FlowModel(nn.Module):
             t_out = st_out[:, 1:2, :, :]
 
             update_mask = 1.0 - current_mask
-            phi_updated = update_mask * (phi * torch.exp(s_out) + t_out)
-            phi = phi_frozen + phi_updated
-
-            log_det_jacobian += torch.sum(update_mask * s_out, dim=(1, 2, 3))
+            # 🌟 统一仿射公式为逆向方程： y = (x - t) * exp(-s)
+            phi = phi_frozen + update_mask * ((phi - t_out) * torch.exp(-s_out))
+            log_det_jacobian += torch.sum(update_mask * (-s_out), dim=(1, 2, 3))
 
         return phi, log_det_jacobian
 
@@ -418,8 +424,10 @@ def train(config, resume = True):
             # 【新增代码】每 5000 步保存一次当前迭代次数的模型
             # ==========================================
             if iteration % 5000 == 0:
-                # 注意：这里的变量是当前的 iteration，而不是 CONFIG['iterations']
-                milestone_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
+                # 🌟 加入 branch_depth 支持，保持命名系统一致
+                depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
+                milestone_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_{depth_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
+
                 torch.save({
                     'iteration': iteration,
                     'model_state_dict': model.state_dict(),

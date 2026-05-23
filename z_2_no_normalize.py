@@ -37,7 +37,7 @@ def auto_find_latest_checkpoint(config):
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
     base_pattern = (
-        f"z_2_symmetry_shared_coupling_model_double_precision_*_"
+        f"z_2_no_normalize_symmetry_shared_coupling_model_double_precision_*_"
         f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
@@ -96,10 +96,10 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-save_path = f"best_z_2_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"z_2_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_z_2_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_z_2_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+save_path = f"best_z_2_no_normalize_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"z_2_no_normalize_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_z_2_no_normalize_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_z_2_no_normalize_symmetry_shared_coupling_model_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -133,14 +133,14 @@ def create_checkerboard_mask(L):
     return mask_2d.view(1, 1, L, L).float()
 
 
-class LeakyTanh(nn.Module):
-    def __init__(self, alpha=0.1):
+class OddELU(nn.Module):
+    def __init__(self, alpha=1.0):
         super().__init__()
         self.alpha = alpha
-        self.beta = 1.0 - alpha
 
     def forward(self, x):
-        return self.alpha * x + self.beta * torch.tanh(x)
+        # 完美的奇函数，兼顾非线性与信号穿透力
+        return F.elu(x, self.alpha) - F.elu(-x, self.alpha)
 
 
 class CompiledWeightNormConv2d(nn.Module):
@@ -184,10 +184,10 @@ class ResBlock(nn.Module):
 
         # 🌟 直接使用我们的自定义纯净版 WeightNorm
         self.conv1 = CompiledWeightNormConv2d(channels, channels, kernel_size=kernel_size)
-        self.act1 = LeakyTanh()
+        self.act1 = OddELU()
 
         self.conv2 = CompiledWeightNormConv2d(channels, channels, kernel_size=kernel_size)
-        self.act2 = LeakyTanh()
+        self.act2 = OddELU()
 
         self.conv3 = nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=0, bias=False)
         self._initialize_weights()
@@ -239,21 +239,19 @@ class MultiScaleResBlock(nn.Module):
 
             layers = nn.ModuleList()
             for _ in range(branch_depth):
-                # 🌟 核心修改 1：彻底移除 padding_mode='circular'，强制设为 padding=0
-                layers.append(CompiledWeightNormConv2d(channels, channels, kernel_size=k, dilation=d))
-                # 2. 激活层 (移除了中间的 Norm)
-                layers.append(LeakyTanh())
+                layers.append(nn.Conv2d(channels, channels, kernel_size=k, dilation=d, padding=0, bias=False))
+                layers.append(OddELU())
             self.branches.append(layers)
 
         # 融合卷积层：负责将多个多尺度特征压缩回原始通道数。
         self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=False)
 
-        self._initialize_weights()
+        # self._initialize_weights()
         # 🌟 核心修改 1：不直接训练 alpha，而是训练不受限的 raw_alpha
-        self.raw_alpha = nn.Parameter(torch.zeros(1))
+        # self.raw_alpha = nn.Parameter(torch.zeros(1))
         # 设定 alpha 的绝对物理上限，比如 1.0 (允许残差分支最大提供 1 倍的信号)
         # 你可以根据对流模型的预期将其设为 0.5 或 2.0
-        self.max_alpha = 1.0
+        # self.max_alpha = 1.0
 
     def _initialize_weights(self):
         # 🌟 流模型核心技巧：零初始化 (Zero-init for Flow Residuals)
@@ -294,7 +292,7 @@ class MultiScaleResBlock(nn.Module):
         # 🌟 核心修改 2：用 tanh 将 raw_alpha 强行压在 [-max_alpha, max_alpha] 之间
         # 初始时 raw_alpha = 0，tanh(0) = 0，完美保持了恒等映射的初始化
         # 训练后期就算 raw_alpha 跑到 1000，safe_alpha 也只会平滑地逼近 1.0
-        safe_alpha = self.max_alpha * torch.tanh(self.raw_alpha)
+        # safe_alpha = self.max_alpha * torch.tanh(self.raw_alpha)
 
         # return x + safe_alpha * out
         return x + out
@@ -307,7 +305,7 @@ class ConvContextNet(nn.Module):
         layers = []
         layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1,
                                 padding=1, bias=False))
-        layers.append(LeakyTanh())
+        layers.append(OddELU())
 
         for _ in range(num_hidden_layers):
             if use_multi_kernel:
@@ -324,11 +322,10 @@ class ConvContextNet(nn.Module):
         # 🌟 根据切分比例，重新定义出口层的输入通道
         c = hidden_channels // 4
 
-        # s_exit 接收 1/4 的通道 (h_even 的维度)
-        self.s_exit_conv = nn.Conv2d(c, 1, kernel_size=1, stride=1, bias=True)
-
-        # t_exit 接收剩下的 1/2 的独立通道
-        self.t_exit_conv = nn.Conv2d(hidden_channels - 2 * c, 1, kernel_size=1, stride=1, bias=False)
+        # 🌟 革命性架构：不再做通道截肢！
+        # 两个出口均使用完整的 16 维特征空间
+        self.s_exit_conv = nn.Conv2d(hidden_channels, 1, kernel_size=1, stride=1, bias=True)
+        self.t_exit_conv = nn.Conv2d(hidden_channels, 1, kernel_size=1, stride=1, bias=False)
 
         self._initialize_weights()
 
@@ -342,24 +339,16 @@ class ConvContextNet(nn.Module):
         nn.init.zeros_(self.t_exit_conv.weight)
 
     def forward(self, x):
+        # 1. 经过 OddELU 主干，此时 out 绝对是一个完美的奇函数特征图
         out = self.net(x)
 
-        # 🌟 破除耦合的核心：通道硬切分
-        c = out.shape[1] // 4
+        # 2. t_out 需要是奇函数，直接通过无 Bias 的 1x1 卷积全通道映射
+        t_out = self.t_exit_conv(out)
 
-        # 独立通道 1 和 2：专属用于构造偶函数 s
-        h_s1 = out[:, 0:c, :, :]
-        h_s2 = out[:, c:2 * c, :, :]
-
-        # 独立通道 3：专属用于直接输出奇函数 t
-        h_t_base = out[:, 2 * c:, :, :]
-
-        # 分支 1：计算偶函数 s
-        h_even = h_s1 * torch.tanh(h_s2)
+        # 3. s_out 需要是偶函数。奇函数 * tanh(奇函数) = 偶函数！
+        # 完美利用全部 16 个通道构建对称特征图，毫无算力浪费
+        h_even = F.softplus(out) + F.softplus(-out)
         s_out = self.s_exit_conv(h_even)
-
-        # 分支 2：计算奇函数 t (完全不依赖 h_s1 和 h_s2)
-        t_out = self.t_exit_conv(h_t_base)
 
         return torch.cat([s_out, t_out], dim=1)
 
