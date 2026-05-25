@@ -36,7 +36,7 @@ def auto_find_latest_checkpoint(config):
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
     base_pattern = (
-        f"aligned_prior_cnn_double_precision_*_"
+        f"bimodal_no_z_2_double_precision_*_"
         f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
@@ -95,11 +95,11 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-# 文件名修改为 aligned_prior_cnn
-save_path = f"best_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+# 文件名修改为 bimodal_no_z_2
+save_path = f"best_bimodal_no_z_2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"bimodal_no_z_2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_bimodal_no_z_2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_bimodal_no_z_2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -131,22 +131,6 @@ def create_checkerboard_mask(L):
     indices = torch.arange(L)
     mask_2d = (indices[:, None] + indices[None, :]) % 2 == 0
     return mask_2d.view(1, 1, L, L).float()
-
-
-class CompiledWeightNormConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
-        super().__init__()
-        self.dilation = dilation
-        self.weight_v = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
-        nn.init.kaiming_uniform_(self.weight_v, a=math.sqrt(5))
-        with torch.no_grad():
-            initial_norm = torch.sqrt(torch.sum(self.weight_v ** 2, dim=(1, 2, 3), keepdim=True))
-        self.weight_g = nn.Parameter(initial_norm)
-
-    def forward(self, x):
-        v_norm = torch.sqrt(torch.sum(self.weight_v ** 2, dim=(1, 2, 3), keepdim=True))
-        w = self.weight_g * (self.weight_v / (v_norm + 1e-8))
-        return F.conv2d(x, w, bias=None, stride=1, padding=0, dilation=self.dilation)
 
 
 class ResBlock(nn.Module):
@@ -184,14 +168,22 @@ class MultiScaleResBlock(nn.Module):
 
             layers = nn.ModuleList()
             for _ in range(branch_depth):
-                layers.append(nn.Conv2d(channels, channels, kernel_size=k, dilation=d, padding=0, bias=False))
+                # 🌟 修复 1：满血回归，将 bias=False 改为 bias=True，与 Z_2 原版绝对对齐
+                layers.append(nn.Conv2d(channels, channels, kernel_size=k, dilation=d, padding=0, bias=True))
                 layers.append(nn.LeakyReLU(0.01))
             self.branches.append(layers)
 
-        self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=False)
+        # 🌟 修复 2：融合层同样恢复 bias=True
+        self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=True)
+
+        # 🌟 修复 3：补上之前漏掉的初始化调用！这关乎到残差块防爆盾的生死存亡
+        self._initialize_weights()
 
     def _initialize_weights(self):
+        # 权重初始化为极小值，确保初始状态趋近于恒等映射
         nn.init.normal_(self.fusion_conv.weight, mean=0.0, std=0.01)
+        # 🌟 修复 4：严谨地将新增的 bias 清零，防止起步阶段出现偏移漂移
+        nn.init.zeros_(self.fusion_conv.bias)
 
     def forward(self, x):
         outs = []
@@ -262,25 +254,59 @@ class ConvContextNet(nn.Module):
 # ==========================================
 # 4. 自由场先验
 # ==========================================
-class FreeFieldPrior(nn.Module):
-    def __init__(self, L, m_sq_prior):
+class BimodalFreeFieldPrior(nn.Module):
+    def __init__(self, L, m_sq, lam):
         super().__init__()
         self.L = L
         self.V = L * L
+
+        # 1. 物理学计算
+        self.v = math.sqrt(-m_sq / (2.0 * lam))
+        m_eff_sq = -2.0 * m_sq
+
+        # 预先计算并缓存解析解所需的物理常数
+        self.K_0 = m_eff_sq
+        self.sqrt_2K_0 = math.sqrt(2.0 * self.K_0)
+
+        # 2. 构造动量空间算子
         p = torch.arange(L) * 2.0 * math.pi / L
         P1, P2 = torch.meshgrid(p, p, indexing='ij')
-        K = m_sq_prior + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
+        K = m_eff_sq + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
+
+        self.register_buffer('v_tensor', torch.tensor(self.v))
         self.register_buffer('sqrt_2K', torch.sqrt(2.0 * K).view(1, 1, L, L))
         self.register_buffer('log_det_factor', 0.5 * torch.sum(torch.log(2.0 * K)))
         self.register_buffer('const_factor', torch.tensor(0.5 * self.V * math.log(2.0 * math.pi)))
 
     def sample(self, batch_size):
-        eta = torch.randn(batch_size, 1, self.L, self.L, device=self.sqrt_2K.device, dtype=self.sqrt_2K.dtype)
+        device = self.sqrt_2K.device
+        dtype = self.sqrt_2K.dtype
+
+        # 1. 采样标准的自由场波动 (天然无误差)
+        eta = torch.randn(batch_size, 1, self.L, self.L, device=device, dtype=dtype)
         eta_k = torch.fft.fftn(eta, dim=(-2, -1), norm="ortho")
         phi_k = eta_k / self.sqrt_2K
         phi_free = torch.fft.ifftn(phi_k, dim=(-2, -1), norm="ortho").real
-        log_p_eta = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) - self.const_factor
-        return phi_free, log_p_eta + self.log_det_factor
+
+        # 2. 全局平移生成物理构型
+        signs = torch.randint(0, 2, size=(batch_size, 1, 1, 1), device=device).to(dtype) * 2.0 - 1.0
+        phi_bimodal = phi_free + signs * self.v_tensor
+
+        # 3. 极速、零误差的 GMM Log 概率解析计算
+        # (a) 样本在其“出生”势阱中的精确概率
+        log_p_s = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) - self.const_factor + self.log_det_factor
+
+        # (b) O(1) 算出样本在“另一个”势阱中的概率（彻底消灭 FFT 误差）
+        eta_sum = torch.sum(eta, dim=(1, 2, 3))
+        s_val = signs.view(batch_size)
+
+        delta_p = -2.0 * s_val * self.v * self.sqrt_2K_0 * eta_sum - 4.0 * self.V * (self.v ** 2) * self.K_0
+        log_p_other = log_p_s + delta_p
+
+        # (c) 混合高斯分布的最终概率
+        log_p_z = torch.logaddexp(log_p_s, log_p_other) - math.log(2.0)
+
+        return phi_bimodal, log_p_z
 
 
 # ==========================================
@@ -422,7 +448,7 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+    prior = BimodalFreeFieldPrior(L=CONFIG['L'], m_sq=CONFIG['m_sq'], lam=CONFIG['lam']).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()

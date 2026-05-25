@@ -36,7 +36,7 @@ def auto_find_latest_checkpoint(config):
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
     base_pattern = (
-        f"aligned_prior_cnn_double_precision_*_"
+        f"gaussian_cnn_double_precision_*_"
         f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
@@ -73,7 +73,7 @@ CONFIG = {
     'warmup_steps': 100.0,
     'target_acc_ratio': 0.78,
 
-    'cnn_coupling_layers': 6,  # 严格对齐，改为 6 层，依靠网络复用进行 12 次前向
+    'cnn_coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
@@ -95,11 +95,10 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-# 文件名修改为 aligned_prior_cnn
-save_path = f"best_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+save_path = f"best_gaussian_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"gaussian_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_gaussian_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_gaussian_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -115,7 +114,7 @@ laplacian_kernel = torch.tensor([[
 
 
 # ==========================================
-# 2. 标量场理论的 Action 计算 (对齐 Z_2 提速版)
+# 2. 标量场理论的 Action 计算
 # ==========================================
 def compute_action(phi):
     phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
@@ -125,7 +124,7 @@ def compute_action(phi):
 
 
 # ==========================================
-# 3. 掩码生成与卷积上下文网络 (剔除 Z_2 对称性出口)
+# 3. 掩码生成与卷积上下文网络
 # ==========================================
 def create_checkerboard_mask(L):
     indices = torch.arange(L)
@@ -152,10 +151,7 @@ class CompiledWeightNormConv2d(nn.Module):
 class ResBlock(nn.Module):
     def __init__(self, channels, kernel_size=3, branch_depth=3):
         super().__init__()
-        # 动态计算 padding
         pad = kernel_size // 2
-
-        # 🌟 修改：使用动态网络容器堆叠指定数量的 卷积+激活层
         layers = []
         for _ in range(branch_depth):
             layers.append(
@@ -165,7 +161,6 @@ class ResBlock(nn.Module):
         self.block = nn.Sequential(*layers)
 
     def forward(self, x):
-        # 🌟 现在的残差连接极其简洁
         return x + self.block(x)
 
 
@@ -215,11 +210,10 @@ class ConvContextNet(nn.Module):
                  multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
 
-        # 🌟 构造独立的子网络，向 bimodal_z_2 的 full_capacity_net 严格看齐
         def build_independent_net():
             layers = []
-            # 入口层：对齐 circular padding 和 bias=True，确保感受野和参数量完全一致
-            layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1, padding=1, padding_mode='circular', bias=True))
+            layers.append(
+                nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1, padding=1, padding_mode='circular', bias=True))
             layers.append(nn.LeakyReLU(0.01))
 
             for _ in range(num_hidden_layers):
@@ -229,62 +223,55 @@ class ConvContextNet(nn.Module):
                 else:
                     layers.append(ResBlock(hidden_channels, kernel_size=kernel_size, branch_depth=branch_depth))
 
-            # 🌟 出口层：移除冗余的 1x1 隐藏过渡层，直接降维输出 1 个通道 (s 或 t)
             layers.append(nn.Conv2d(hidden_channels, 1, kernel_size=1, stride=1, padding=0, bias=True))
             return nn.Sequential(*layers)
 
-        # 拆分为完全独立的 s 网络和 t 网络
         self.s_net = build_independent_net()
         self.t_net = build_independent_net()
 
         self._initialize_weights()
 
     def _initialize_weights(self):
-        # 初始化 s 网络：确保初始尺度收缩趋近于 1 (即 s=0)
         nn.init.normal_(self.s_net[0].weight, mean=0, std=0.1)
         nn.init.zeros_(self.s_net[-1].weight)
         nn.init.zeros_(self.s_net[-1].bias)
 
-        # 初始化 t 网络：确保初始平移趋近于 0
         nn.init.normal_(self.t_net[0].weight, mean=0, std=0.1)
         nn.init.zeros_(self.t_net[-1].weight)
         nn.init.zeros_(self.t_net[-1].bias)
 
     def forward(self, x):
-        # 分别进行独立前向计算
         s_out = self.s_net(x)
         t_out = self.t_net(x)
-
-        # 拼接为 (B, 2, H, W) 以便无缝接入外部 FlowModel 原有的拆分逻辑
         return torch.cat([s_out, t_out], dim=1)
 
 
 # ==========================================
-# 4. 自由场先验
+# 4. 标准高斯先验 (🌟 修改点：替换原有的 FreeFieldPrior)
 # ==========================================
-class FreeFieldPrior(nn.Module):
-    def __init__(self, L, m_sq_prior):
+class StandardGaussianPrior(nn.Module):
+    def __init__(self, L):
         super().__init__()
         self.L = L
         self.V = L * L
-        p = torch.arange(L) * 2.0 * math.pi / L
-        P1, P2 = torch.meshgrid(p, p, indexing='ij')
-        K = m_sq_prior + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
-        self.register_buffer('sqrt_2K', torch.sqrt(2.0 * K).view(1, 1, L, L))
-        self.register_buffer('log_det_factor', 0.5 * torch.sum(torch.log(2.0 * K)))
+
+        # 注册对数概率的常数项: -(V/2) * log(2π)
+        # 使用 register_buffer 保证设备(GPU/CPU)和精度(float32/64)与网络同步
         self.register_buffer('const_factor', torch.tensor(0.5 * self.V * math.log(2.0 * math.pi)))
 
     def sample(self, batch_size):
-        eta = torch.randn(batch_size, 1, self.L, self.L, device=self.sqrt_2K.device, dtype=self.sqrt_2K.dtype)
-        eta_k = torch.fft.fftn(eta, dim=(-2, -1), norm="ortho")
-        phi_k = eta_k / self.sqrt_2K
-        phi_free = torch.fft.ifftn(phi_k, dim=(-2, -1), norm="ortho").real
-        log_p_eta = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) - self.const_factor
-        return phi_free, log_p_eta + self.log_det_factor
+        # 1. 采样 Z ~ N(0, I)
+        z = torch.randn(batch_size, 1, self.L, self.L,
+                        device=self.const_factor.device,
+                        dtype=self.const_factor.dtype)
+
+        # 2. 计算 log p(z) = \sum (-0.5 * z^2) - 常数项
+        log_p_z = -0.5 * torch.sum(z ** 2, dim=(1, 2, 3)) - self.const_factor
+        return z, log_p_z
 
 
 # ==========================================
-# 5. 流模型 (包含防爆盾和双循环重用)
+# 5. 流模型
 # ==========================================
 class FlowModel(nn.Module):
     def __init__(self, config):
@@ -296,7 +283,6 @@ class FlowModel(nn.Module):
         self.context_nets = nn.ModuleList()
         dtype = torch.float64 if config.get('double_precision', False) else torch.float32
 
-        # 防爆盾边界
         self.register_buffer('s_bounds', torch.tensor([-0.5, 4.0], dtype=dtype))
         self.register_buffer('t_bounds', torch.tensor([-15.0, 15.0], dtype=dtype))
 
@@ -315,7 +301,7 @@ class FlowModel(nn.Module):
             arch_info = f"单核: {config['kernel_size']}"
 
         print("=" * 70)
-        print(f"🌟 对齐版 Prior_CNN 物理流模型初始化完毕！")
+        print(f"🌟 Prior_CNN 物理流模型初始化完毕！(标准高斯先验)")
         print(f"👉 总耦合层数: {self.total_layers} 层 (双步复用, 特征通道数: {config['hidden_channels']})")
         print(f"   │")
         print(f"   ├─ [结构对齐] 网络不具备内部 Z_2 结构，全靠数据驱动学习")
@@ -324,7 +310,6 @@ class FlowModel(nn.Module):
         print("=" * 70)
 
     def step_warmup(self, progress):
-        """只负责放宽边界，防爆盾的开关由外部的 .train() 和 .eval() 决定"""
         if progress < 1.0:
             self.s_bounds[0].fill_(-0.5 - 1.5 * progress)
             self.s_bounds[1].fill_(4.0 + 4.0 * progress)
@@ -340,13 +325,11 @@ class FlowModel(nn.Module):
         phi = z
         log_det_jacobian = 0
 
-        # 对齐 Z_2 脚本的参数复用逻辑：每个网络跑两次 (奇数格/偶数格)
         for net in self.context_nets:
             for step in range(2):
                 current_mask = self.base_mask if step == 0 else (1.0 - self.base_mask)
                 phi_frozen = current_mask * phi
 
-                # 拿到没有任何 Z_2 保护的标准 s 和 t
                 st_out = net(phi_frozen)
                 s_out, t_out = st_out[:, 0:1, :, :], st_out[:, 1:2, :, :]
 
@@ -361,7 +344,6 @@ class FlowModel(nn.Module):
 
                 update_mask = 1.0 - current_mask
 
-                # 🌟 统一仿射公式为逆向方程： y = (x - t) * exp(-s)
                 phi = phi_frozen + update_mask * ((phi - t_out) * torch.exp(-s_out))
                 log_det_jacobian += torch.sum(update_mask * (-s_out), dim=(1, 2, 3))
 
@@ -422,7 +404,9 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+
+    # 🌟 修改点：这里将 FreeFieldPrior 修改为 StandardGaussianPrior
+    prior = StandardGaussianPrior(L=CONFIG['L']).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()
@@ -479,6 +463,8 @@ def train():
     model.train()
     for iteration in range(start_iteration, CONFIG['iterations'] + 1):
         optimizer.zero_grad()
+
+        # 使用高斯先验进行采样
         z, log_p_z = prior.sample(CONFIG['batch_size'])
 
         warmup_steps = CONFIG['warmup_steps']
