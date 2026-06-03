@@ -40,7 +40,7 @@ def auto_find_latest_checkpoint(config):
 
     # 提取通用的核心匹配字符串 (忽略双精度开关和迭代次数的差异)
     base_pattern = (
-        f"prior_cnn_res_model_double_precision_*_"
+        f"dressed_mass_prior_model_double_precision_*_"
         f"{config['L']}_coupling_layers_{config['coupling_layers']}_"
         f"kernel_size_{config['kernel_size']}_{depth_str}_"  # 🌟 插入 depth_str
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
@@ -109,7 +109,7 @@ CONFIG = {
 }
 # 🌟 新增：拼接带有 depth 的公用后缀
 depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
-base_suffix = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_{depth_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}"
+base_suffix = f"dressed_mass_prior_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_{depth_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}"
 
 save_path = f"best_{base_suffix}.pt"
 loss_save_path = f"{base_suffix}_loss_history.npy"
@@ -472,7 +472,7 @@ def train(config, resume = True):
             if iteration % 5000 == 0:
                 # 🌟 加入 branch_depth 支持，保持命名系统一致
                 depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
-                milestone_path = f"prior_cnn_res_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_{depth_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
+                milestone_path = f"dressed_mass_prior_model_double_precision_{CONFIG['double precision']}_{CONFIG['L']}_coupling_layers_{CONFIG['coupling_layers']}_kernel_size_{CONFIG['kernel_size']}_{depth_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{iteration}.pt"
 
                 torch.save({
                     'iteration': iteration,
