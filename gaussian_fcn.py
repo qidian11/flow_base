@@ -60,13 +60,13 @@ CONFIG = {
     'use_scheduler': True,
     'scheduler_min': 1e-5,
     'iterations': 25000,
-    'warmup_steps': 5000.0,
+    'warmup_steps': 8000.0,
     'target_acc_ratio': 0.78,
 
     # 🌟 修改点：FCN 架构参数
     'fcn_coupling_layers': 12,
     'hidden_layers': 8,  # MLP 的隐藏层数量
-    'hidden_features': 448,  # MLP 的隐藏层神经元宽度
+    'hidden_features': 320,  # MLP 的隐藏层神经元宽度
     'double_precision': False,
 }
 
@@ -137,11 +137,11 @@ class FCNContextNet(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
-        nn.init.normal_(self.s_net[0].weight, mean=0, std=0.1)
+        nn.init.normal_(self.s_net[0].weight, mean=0, std=0.01)
         nn.init.zeros_(self.s_net[-1].weight)
         nn.init.zeros_(self.s_net[-1].bias)
 
-        nn.init.normal_(self.t_net[0].weight, mean=0, std=0.1)
+        nn.init.normal_(self.t_net[0].weight, mean=0, std=0.01)
         nn.init.zeros_(self.t_net[-1].weight)
         nn.init.zeros_(self.t_net[-1].bias)
 

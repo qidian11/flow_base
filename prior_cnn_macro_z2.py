@@ -81,7 +81,7 @@ CONFIG = {
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 16,
+    'hidden_channels': 32,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
