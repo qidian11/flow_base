@@ -36,7 +36,7 @@ def auto_find_latest_checkpoint(config):
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
     base_pattern = (
-        f"dressed_mass_prior_double_precision_*_"
+        f"bimodal_vacuum_prior_double_precision_*_"
         f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
@@ -95,11 +95,11 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-# 文件名修改为 dressed_mass_prior
-save_path = f"best_dressed_mass_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"dressed_mass_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_dressed_mass_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_dressed_mass_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+# 文件名修改为 bimodal_vacuum_prior
+save_path = f"best_bimodal_vacuum_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+loss_save_path = f"bimodal_vacuum_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
+checkpoint_path = f"latest_bimodal_vacuum_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
+phi_ensemble_save_path = f"phi_ensemble_bimodal_vacuum_prior_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -260,68 +260,107 @@ class ConvContextNet(nn.Module):
 
 
 # ==========================================
-# 4. 自由场先验
+# 4. 双峰拓扑混合先验 (Gaussian Mixture Prior)
 # ==========================================
-class FreeFieldPrior(nn.Module):
-    def __init__(self, L, m_sq_prior):
+class BimodalVacuumPrior(nn.Module):
+    def __init__(self, L, m_eff_sq, v):
         super().__init__()
         self.L = L
         self.V = L * L
+        self.register_buffer('v', torch.tensor(v))  # 保存背景场强度
+
         p = torch.arange(L) * 2.0 * math.pi / L
         P1, P2 = torch.meshgrid(p, p, indexing='ij')
-        K = m_sq_prior + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
+        K = m_eff_sq + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
+
         self.register_buffer('sqrt_2K', torch.sqrt(2.0 * K).view(1, 1, L, L))
         self.register_buffer('log_det_factor', 0.5 * torch.sum(torch.log(2.0 * K)))
         self.register_buffer('const_factor', torch.tensor(0.5 * self.V * math.log(2.0 * math.pi)))
 
     def sample(self, batch_size):
+        # 1. 采样自由场量子涨落 (基于 m_eff_sq)
         eta = torch.randn(batch_size, 1, self.L, self.L, device=self.sqrt_2K.device, dtype=self.sqrt_2K.dtype)
         eta_k = torch.fft.fftn(eta, dim=(-2, -1), norm="ortho")
         phi_k = eta_k / self.sqrt_2K
-        phi_free = torch.fft.ifftn(phi_k, dim=(-2, -1), norm="ortho").real
-        log_p_eta = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) - self.const_factor
-        return phi_free, log_p_eta + self.log_det_factor
+        phi_fluct = torch.fft.ifftn(phi_k, dim=(-2, -1), norm="ortho").real
+
+        # 2. 抛硬币决定拓扑扇区 (生成 +v 或 -v 的背景场)
+        # torch.randint(0, 2) 生成 0 或 1，映射为 -1 或 1
+        signs = torch.randint(0, 2, (batch_size, 1, 1, 1), device=self.sqrt_2K.device, dtype=self.sqrt_2K.dtype) * 2 - 1
+        phi_bg = signs * self.v
+
+        # 3. 组装最终采样场
+        phi_sample = phi_bg + phi_fluct
+
+        # 4. 计算高斯混合分布的精确 Log Prob (核心数值保护区)
+        # 必须分别计算当前样本属于 +v 峰和 -v 峰的独立对数概率
+        log_p_plus = self._compute_single_log_prob(phi_sample - self.v)
+        log_p_minus = self._compute_single_log_prob(phi_sample + self.v)
+
+        # 严格的 log( 0.5 * exp(p_plus) + 0.5 * exp(p_minus) )
+        # = logsumexp([p_plus, p_minus]) - log(2)
+        log_p_stacked = torch.stack([log_p_plus, log_p_minus], dim=1)
+        log_p_mix = torch.logsumexp(log_p_stacked, dim=1) - math.log(2.0)
+
+        return phi_sample, log_p_mix
+
+    def _compute_single_log_prob(self, phi_shifted):
+        """计算场偏离给定真空后的纯高斯涨落对数概率"""
+        phi_shifted_k = torch.fft.fftn(phi_shifted, dim=(-2, -1), norm="ortho")
+        eta_reconstructed_k = phi_shifted_k * self.sqrt_2K
+        eta_reconstructed = torch.fft.ifftn(eta_reconstructed_k, dim=(-2, -1), norm="ortho").real
+        return -0.5 * torch.sum(eta_reconstructed ** 2, dim=(1, 2, 3)) - self.const_factor + self.log_det_factor
 
 
 # ==========================================
-# [新增] 泛函极值求解器：计算理论最优的穿衣质量 (Dressed Mass)
+# [新增] 泛函极值求解器：计算双峰拓扑先验 (Bimodal Vacuum Prior)
 # ==========================================
-def solve_gap_equation_lattice(L, m_sq_bare, lam, device, tol=1e-7, max_iter=1000):
+def solve_bimodal_gap_equations(L, m_sq_bare, lam, device, tol=1e-7, max_iter=1000):
     """
-    通过不动点迭代严格求解格点上的自洽能隙方程，
-    寻找变分最优的高斯协方差核参数。
+    严格求解破缺相 (m^2 < 0) 的耦合能隙方程组：
+    1. 希格斯有效质量 m_eff^2 = -2m^2 - \lambda \Sigma
+    2. 量子修正真空期望值 v = \sqrt{ -6m^2/\lambda - 3\Sigma }
     """
-    dtype = torch.float64  # 极值求解必须使用高精度
+    dtype = torch.float64
     p = torch.arange(L, device=device, dtype=dtype) * 2.0 * math.pi / L
     P1, P2 = torch.meshgrid(p, p, indexing='ij')
-
-    # 动量空间中的格点拉普拉斯本征值 K_hat
     K_hat = 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
 
-    # 初始猜测：为防止破缺相裸质量为负导致对数奇点，取绝对值作为安全起点
-    m_eff_sq = torch.tensor(abs(m_sq_bare), device=device, dtype=dtype)
+    if m_sq_bare >= 0:
+        raise ValueError("此求解器专为破缺相 (m^2 < 0) 设计。对称相请使用单峰穿衣质量。")
+
+    # 初始猜测：以经典树图级别的真空和希格斯质量为起点
+    m_eff_sq = torch.tensor(-2.0 * m_sq_bare, device=device, dtype=dtype)
+    sigma = torch.tensor(0.0, device=device, dtype=dtype)
 
     for i in range(max_iter):
-        # 计算单圈蝌蚪图积分 (Tadpole Integral): (1/V) * Sum_p [1 / (p^2 + m_eff^2)]
-        tadpole = torch.mean(1.0 / (K_hat + m_eff_sq))
+        # 1. 计算单圈蝌蚪图积分 (涨落的方差)
+        sigma_new = torch.mean(1.0 / (K_hat + m_eff_sq))
 
-        # 严格代入波戈留波夫变分导出的极值方程
-        # 注意：此处必须使用物理真实的 m_sq_bare (包含 m^2 = -4.0 的负号)
-        m_new_sq = m_sq_bare + (lam / 2.0) * tadpole
+        # 2. 更新希格斯有效质量
+        m_eff_sq_new = -2.0 * m_sq_bare - lam * sigma_new
+        if m_eff_sq_new <= 0:
+            m_eff_sq_new = torch.tensor(1e-4, device=device, dtype=dtype)
 
-        # 数值保护：若迭代跌入绝对不稳定的纯破缺死区，施加极小的正截断
-        if m_new_sq <= 0:
-            m_new_sq = torch.tensor(1e-4, device=device, dtype=dtype)
+        # 3. 更新真空期望值 (VEV) 的平方
+        v_sq_new = (-6.0 * m_sq_bare / lam) - 3.0 * sigma_new
+        if v_sq_new <= 0:
+            v_sq_new = torch.tensor(1e-4, device=device, dtype=dtype)
 
         # 检查收敛
-        if torch.abs(m_new_sq - m_eff_sq) < tol:
-            print(f"🌟 最优高斯核求解成功! (迭代 {i} 次) | 裸质量^2: {m_sq_bare} -> 穿衣质量^2: {m_new_sq.item():.4f}")
-            return m_new_sq.item()
+        if torch.abs(m_eff_sq_new - m_eff_sq) < tol and torch.abs(sigma_new - sigma) < tol:
+            vev = math.sqrt(v_sq_new.item())
+            print(f"🌟 双峰能隙方程收敛! (迭代 {i} 次)")
+            print(f"   ├─ 希格斯有效质量^2: {m_eff_sq_new.item():.4f}")
+            print(f"   └─ 量子修正真空期望值 ±v: {vev:.4f}")
+            return m_eff_sq_new.item(), vev
 
-        m_eff_sq = m_new_sq
+        m_eff_sq = m_eff_sq_new
+        sigma = sigma_new
 
-    print(f"⚠️ 能隙方程达到最大迭代次数未完全收敛，返回最后近似值: {m_eff_sq.item():.4f}")
-    return m_eff_sq.item()
+    vev = math.sqrt(max(1e-4, ((-6.0 * m_sq_bare / lam) - 3.0 * sigma.item())))
+    print(f"⚠️ 双峰能隙方程未完全收敛，返回最后近似值 | 质量^2: {m_eff_sq.item():.4f}, v: {vev:.4f}")
+    return m_eff_sq.item(), vev
 
 
 # ==========================================
@@ -463,14 +502,15 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    # ====== [核心修改] 注入变分最优先验 ======
+
+    # ====== [核心修改] 注入拓扑双峰变分先验 ======
     print("\n" + "=" * 70)
-    print("🛠️ 正在求解变分泛函极值，计算最优先验 (Dressed Gaussian Prior)...")
-    m_sq_dressed = solve_gap_equation_lattice(CONFIG['L'], CONFIG['m_sq'], CONFIG['lam'], device)
+    print("🛠️ 正在求解耦合能隙方程组，计算拓扑混合先验 (Bimodal Vacuum Prior)...")
+    m_eff_sq, vev = solve_bimodal_gap_equations(CONFIG['L'], CONFIG['m_sq'], CONFIG['lam'], device)
     print("=" * 70 + "\n")
 
-    # 将原先的粗糙估计 abs(CONFIG['m_sq']) 替换为理论极值 m_sq_dressed
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=m_sq_dressed).to(device)
+    # 使用解出的希格斯有效质量和真空期望值初始化双峰先验
+    prior = BimodalVacuumPrior(L=CONFIG['L'], m_eff_sq=m_eff_sq, v=vev).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()

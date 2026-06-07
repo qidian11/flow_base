@@ -68,9 +68,10 @@ CONFIG = {
     'batch_size': 1024,
     'lr': 1e-3,
     'use_scheduler': True,
-    'scheduler_min': 1e-5,
-    'iterations': 25000,
-    'warmup_steps': 100.0,
+    'scheduler_min': 5e-6,
+    'iterations': 40000,          # 🌟 修改：总步数改为 35000 (25000 + 10000)
+    'scheduler_steps': 35000,     # 🌟 新增：前多少步使用调度器
+    'warmup_steps': 1000.0,
     'target_acc_ratio': 0.78,
     # 🌟 修改点 1：精确控制 lambda_sym 的生效区间
     'lambda_sym_max': 1.0,        # 惩罚系数的最大值
@@ -81,7 +82,7 @@ CONFIG = {
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 32,
+    'hidden_channels': 64,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -452,7 +453,7 @@ def train():
     if CONFIG.get('use_scheduler', True):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=CONFIG['iterations'],
+            T_max=CONFIG['scheduler_steps'],  # 🌟 修改：由 CONFIG['iterations'] 改为 CONFIG['scheduler_steps']
             eta_min=CONFIG['scheduler_min'],
             last_epoch=start_iteration - 1 if start_iteration > 1 else -1
         )
@@ -512,7 +513,12 @@ def train():
         else:
             optimizer.step()
 
-        if scheduler: scheduler.step()
+        # 🌟 修改：只在前 25000 步推进 scheduler，之后停止推进并维持当前学习率
+        if scheduler and iteration <= CONFIG['scheduler_steps']:
+            scheduler.step()
+        elif iteration == CONFIG['scheduler_steps'] + 1:
+            print(
+                f"🔄 调度器已完成前 {CONFIG['scheduler_steps']} 步降速，后续 10000 步学习率将固定在: {optimizer.param_groups[0]['lr']:.2e}")
 
         loss_val = loss.item()
         history_loss.append(loss_val)
