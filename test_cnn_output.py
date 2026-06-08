@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from cnn_flow import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
+from prior_cnn_macro_z2 import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
 
 
 def load_trained_model(checkpoint_path, L, coupling_layers):
@@ -78,10 +78,15 @@ if __name__ == "__main__":
     # 假设你的模型保存在这里
     # PATH = "best_cnn_model.pt"
     PATH = CONFIG['save_path']
+
+
+    def convert_path(path):
+        return path.replace("best_", "ensemble_").replace(".pt", ".npy")
+    ensemble_path = convert_path(PATH)
     trained_model = load_trained_model(PATH, CONFIG['L'], CONFIG['coupling_layers'])
 
     # 生成 10,000 个构型
     final_configs = produce_ensemble(trained_model, total_n=10000)
 
     # 保存结果供后续物理分析（如计算 Green's function）
-    np.save("phi_ensemble.npy", final_configs)
+    np.save(ensemble_path, final_configs)
