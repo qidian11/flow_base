@@ -62,6 +62,7 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
+    'type': 'aligned_prior_cnn',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,

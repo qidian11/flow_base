@@ -2,8 +2,9 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from HMC_final import CONFIG
-
+# from HMC_final import CONFIG
+from prior_cnn_macro_z2 import CONFIG
+# from aligned_prior_cnn import CONFIG
 
 def get_device(prefer="auto"):
     if prefer == "cuda" and torch.cuda.is_available():
@@ -194,7 +195,7 @@ def main(ensemble_tensor, bin_size=100, boot_time=2000):
 
     # 将计算结果打包保存为 npz 文件
     # 文件名自动带上当前的晶格尺寸 L
-    save_filename = f"{CONFIG['Type']}_observables_result_L{CONFIG['L']}_double_precision_{CONFIG['double precision']}.npz"
+    save_filename = f"{CONFIG['type']}_observables_result_L{CONFIG['L']}_double_precision_{CONFIG['double_precision']}.npz"
     np.savez_compressed(
         save_filename,
         G_t_mean=G_t_mean,
@@ -272,7 +273,7 @@ def main(ensemble_tensor, bin_size=100, boot_time=2000):
 
 
 if __name__ == '__main__':
-    CONFIG= CONFIG[-1]
+    # CONFIG= CONFIG[-1]
     ensemble_path = CONFIG['phi_ensemble_save_path']
     data = np.load(ensemble_path)
     # 假设你之前存的是 npz 文件中的 'configs'

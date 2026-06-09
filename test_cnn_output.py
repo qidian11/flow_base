@@ -3,15 +3,21 @@ import numpy as np
 from prior_cnn_macro_z2 import FlowModel, compute_action, CONFIG, device  # 复用你之前的定义
 
 
-def load_trained_model(checkpoint_path, L, coupling_layers):
+def load_trained_model(config):
     """加载保存的模型权重"""
-    model = FlowModel(L=L,coupling_layers=coupling_layers).to(device)
-    # map_location 确保在没有 GPU 的机器上也能加载
-    state_dict = torch.load(checkpoint_path, map_location=device)
+    model = FlowModel(config).to(device)
+
+    # 直接通过 config 获取路径并读取
+    file_path = config['save_path']
+    state_dict = torch.load(file_path, map_location=device)
 
     # 如果保存的是整个 dict (包含 optimizer)，则取 model_state_dict
     if 'model_state_dict' in state_dict:
-        model.load_state_dict(state_dict['model_state_dict'])
+        # 你之前的代码中将 state_dict 中包含 '_orig_mod.' 的 key 做了清理，
+        # 如果你这里保存的是 torch.compile 后的权重，可能也需要像 prior_cnn_macro_z2.py
+        # 第 344 行那样做一下 key 的清理，否则直接 load 即可：
+        clean_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict['model_state_dict'].items()}
+        model.load_state_dict(clean_dict)
     else:
         model.load_state_dict(state_dict)
 
@@ -83,10 +89,10 @@ if __name__ == "__main__":
     def convert_path(path):
         return path.replace("best_", "ensemble_").replace(".pt", ".npy")
     ensemble_path = convert_path(PATH)
-    trained_model = load_trained_model(PATH, CONFIG['L'], CONFIG['coupling_layers'])
+    trained_model = load_trained_model(CONFIG)
 
     # 生成 10,000 个构型
-    final_configs = produce_ensemble(trained_model, total_n=10000)
+    final_configs = produce_ensemble(trained_model, total_n=50000)
 
     # 保存结果供后续物理分析（如计算 Green's function）
     np.save(ensemble_path, final_configs)

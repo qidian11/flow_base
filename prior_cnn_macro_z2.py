@@ -15,7 +15,6 @@ device = torch.device(
 )
 print(f"运行设备: {device}")
 
-
 def is_valid_checkpoint(filepath):
     try:
         torch.load(filepath, map_location='cpu', weights_only=False)
@@ -25,7 +24,7 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    layer_str = f"layers_{config['cnn_coupling_layers']}cnn"
+    layer_str = f"layers_{config['coupling_layers']}cnn"
     depth_str = f"depth_{config.get('branch_depth', 3)}"
 
     if config.get('use_multi_kernel', False):
@@ -37,7 +36,7 @@ def auto_find_latest_checkpoint(config):
 
     base_pattern = (
         f"prior_cnn_macro_z2_double_precision_*_"
-        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
+        f"{config['L']}_coupling_layers_{(config['coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
@@ -62,6 +61,7 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
+    'type':'prior_cnn_macro_z2',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -78,7 +78,7 @@ CONFIG = {
     'sym_warmup_start': 3000,     # 小于这个步数时，lambda_sym 严格为 0
     'sym_warmup_end': 8000,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
 
-    'cnn_coupling_layers': 6,
+    'coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
@@ -89,8 +89,8 @@ CONFIG = {
     'multi_kernel_dilations': (1,),
 }
 
-total_coupling_layers = CONFIG['cnn_coupling_layers']
-layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn"
+total_coupling_layers = CONFIG['coupling_layers']
+layer_str = f"layers_{CONFIG['coupling_layers']}cnn"
 depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
 
 if CONFIG.get('use_multi_kernel', False):
@@ -282,7 +282,7 @@ class FlowModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.L = config['L']
-        self.cnn_layers = config['cnn_coupling_layers']
+        self.cnn_layers = config['coupling_layers']
         self.total_layers = self.cnn_layers
         self.register_buffer('base_mask', create_checkerboard_mask(self.L))
         self.context_nets = nn.ModuleList()
