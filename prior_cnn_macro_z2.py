@@ -34,8 +34,11 @@ def auto_find_latest_checkpoint(config):
     else:
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
+    # 🌟 修改点：动态读取网络类型前缀，默认兼容旧版的 'prior_cnn_macro_z2'
+    type_prefix = config.get('type', 'prior_cnn_macro_z2')
+
     base_pattern = (
-        f"prior_cnn_macro_z2_double_precision_*_"
+        f"{type_prefix}_double_precision_*_"
         f"{config['L']}_coupling_layers_{(config['coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
@@ -46,14 +49,19 @@ def auto_find_latest_checkpoint(config):
         files = glob.glob(prefix + base_pattern)
         return sorted(files, key=os.path.getmtime, reverse=True)
 
+    # 依次按优先级寻找最新、最佳以及普通权重文件
     for file in get_sorted_files("latest_"):
         if is_valid_checkpoint(file): return file
+
     for file in get_sorted_files("best_"):
         if is_valid_checkpoint(file): return file
+
     for file in get_sorted_files(""):
         filename = os.path.basename(file)
+        # 这里排除了带有特定前缀的文件，严格匹配普通 .pt 权重
         if not filename.startswith(("latest_", "best_")) and is_valid_checkpoint(file):
             return file
+
     return None
 
 
@@ -75,14 +83,14 @@ CONFIG = {
     'target_acc_ratio': 0.78,
     # 🌟 修改点 1：精确控制 lambda_sym 的生效区间
     'lambda_sym_max': 1.0,        # 惩罚系数的最大值
-    'sym_warmup_start': 3000,     # 小于这个步数时，lambda_sym 严格为 0
-    'sym_warmup_end': 8000,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
+    'sym_warmup_start': 15000,     # 小于这个步数时，lambda_sym 严格为 0
+    'sym_warmup_end': 15100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
 
     'coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 64,
+    'hidden_channels': 16,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -100,10 +108,26 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-save_path = f"best_prior_cnn_macro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"prior_cnn_macro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_prior_cnn_macro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_prior_cnn_macro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+# 替换原本的 base_pattern
+base_pattern = (
+    f"{CONFIG.get('type', 'prior_cnn_macro_z2')}_double_precision_*_"
+    f"{CONFIG['L']}_coupling_layers_{(CONFIG['coupling_layers'])}_"
+    f"{k_str}_"
+    f"hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_"
+    f"iterations_*.pt"
+)
+
+# 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
+base_name = (f"{CONFIG.get('type', 'prior_cnn_macro_z2')}_double_precision_"
+             f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
+             f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
+             f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+
+# 在最前面拼接你要求的前缀 (best_, latest_, phi_ensemble_, loss_)
+save_path = f"best_{base_name}.pt"
+loss_save_path = f"loss_{base_name}.npy"  # 统一格式，把 loss 移到了最前面
+checkpoint_path = f"latest_{base_name}.pt"
+phi_ensemble_save_path = f"phi_ensemble_{base_name}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
@@ -362,13 +386,16 @@ def asymmetric_soft_clamp(x, min_val, max_val):
 
 
 # ==========================================
-# 6. 一体化评估核心
+# 6. 一体化评估核心 (修改版：增加 phi^1 到 phi^5 的在线期望计算)
 # ==========================================
 def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
     model.eval()
     total_n = (total_n // batch_size) * batch_size
 
     dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
+
+    # 🌟 新增：预分配 Tensor 以存储所有的提案构型
+    all_phis = torch.empty((total_n, 1, CONFIG['L'], CONFIG['L']), dtype=dtype, device=device)
     all_s = torch.empty(total_n, dtype=dtype, device=device)
     all_log_qs = torch.empty(total_n, dtype=dtype, device=device)
 
@@ -381,28 +408,56 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
             # MCMC 验证阶段直接正常采样，无需引入对立样本
             phi, log_det_J = model(z, dummy_progress)
 
+            # 🌟 新增：记录下所有的提案 phi
+            all_phis[i:i + current_batch] = phi
             all_s[i:i + current_batch] = compute_action(phi)
             all_log_qs[i:i + current_batch] = log_p_z - log_det_J
 
     accepted_count = 0
+    curr_phi = all_phis[0]
     curr_s = all_s[0]
     curr_log_q = all_log_qs[0]
 
     log_rands = torch.log(torch.rand(total_n, device=device, dtype=dtype))
 
+    # 🌟 新增：记录马尔可夫链中的每一个真实状态，用于后续计算观测值
+    chain_phis = torch.empty_like(all_phis)
+    chain_phis[0] = curr_phi
+
     for i in range(1, total_n):
+        prop_phi = all_phis[i]
         prop_s = all_s[i]
         prop_log_q = all_log_qs[i]
 
         log_acc_ratio = (-prop_s - prop_log_q) - (-curr_s - curr_log_q)
 
         if log_rands[i] < log_acc_ratio:
+            curr_phi = prop_phi
             curr_s = prop_s
             curr_log_q = prop_log_q
             accepted_count += 1
 
+        # 记录当前 MCMC 步的构型
+        chain_phis[i] = curr_phi
+
+    # 🌟 新增：计算 phi^1 到 phi^5 的在线期望和朴素误差
+    phi_powers_mean = []
+    phi_powers_err = []
+
+    for power in range(1, 6):
+        # 先求空间维度的均值，得到时间序列 [total_n]
+        pow_seq = (chain_phis ** power).mean(dim=(2, 3)).squeeze()
+        # 求马尔可夫链的期望值
+        mean_val = pow_seq.mean().item()
+        # 朴素标准误 (这里是在线监控，不作复杂的 binning 去相关)
+        err_val = (pow_seq.std() / math.sqrt(total_n)).item()
+
+        phi_powers_mean.append(mean_val)
+        phi_powers_err.append(err_val)
+
     model.train()
-    return accepted_count / (total_n - 1)
+    # 🌟 修改：返回接受率的同时，返回期望值和误差列表
+    return accepted_count / (total_n - 1), phi_powers_mean, phi_powers_err
 
 
 # ==========================================
@@ -484,8 +539,10 @@ def train():
 
         # 🌟 修改点：方案 A - 全局宏观磁化率惩罚 (Global Magnetization Penalty)
         # 计算整个 Batch 内所有样本、所有格点的平均场值，并惩罚其平方
+        # 🌟 修正：补偿体积因子，对齐 Action 的广延量级
+        V = CONFIG['L'] * CONFIG['L']
         batch_mag = torch.mean(phi)
-        loss_sym = batch_mag ** 2
+        loss_sym = V * (batch_mag ** 2)
 
         # 计算延迟生效的动态 lambda_sym
         warmup_start = CONFIG.get('sym_warmup_start', 3000)
@@ -520,18 +577,29 @@ def train():
             print(
                 f"🔄 调度器已完成前 {CONFIG['scheduler_steps']} 步降速，后续 10000 步学习率将固定在: {optimizer.param_groups[0]['lr']:.2e}")
 
-        loss_val = loss.item()
-        history_loss.append(loss_val)
-        ema_loss = loss_val if ema_loss is None else 0.95 * ema_loss + 0.05 * loss_val
+        # ==========================================
+        # 🌟 关键修改 1：将记录的标量指标全部提取为裸 Loss
+        # ==========================================
+        bare_loss_val = loss_kl.item()
+        sym_loss_val = loss_sym.item()
+
+        # 计算 裸Loss 的平滑值
+        ema_loss = bare_loss_val if ema_loss is None else 0.5 * ema_loss + 0.5 * bare_loss_val
+
+        history_loss.append(bare_loss_val)
 
         if iteration % 100 == 0:
-            # 打印时拆分显示 KL 和 Sym Loss，方便监控
+            # 打印时清晰地展示 总Loss、裸KL 和 平滑裸KL
             print(
-                f"迭代 {iteration:6d}/{CONFIG['iterations']} | 总Loss: {loss_val:.4f} (KL: {loss_kl.item():.4f}, Sym: {loss_sym.item():.4f}) | 平滑 Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                f"迭代 {iteration:6d}/{CONFIG['iterations']} | "
+                f"总Loss: {loss:.4f} (裸KL: {bare_loss_val:.4f}, Sym: {sym_loss_val:.4f}) | "
+                f"平滑裸Loss: {ema_loss:.4f} | Best裸: {best_loss:.4f} | "
+                f"λ_sym: {current_lambda_sym:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss,
+                        'loss': bare_loss_val, 'best_loss': best_loss,
                         'history_loss': history_loss, 'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        checkpoint_path)
@@ -541,15 +609,29 @@ def train():
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss, 'ema_loss': ema_loss,
+                        'loss': bare_loss_val, 'best_loss': best_loss,
+                        'history_loss': history_loss,
+                        'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        save_path)
 
-        if iteration >= 10000 and iteration % 2000 == 0:
+        # if iteration >= 10000 and iteration % 2000 == 0:
+        if iteration % 100 == 0:
             print(f"\n{'=' * 50}")
             print(f"🚀 [迭代 {iteration}] 触发 MCMC 在线验证 (样本量: 10000)...")
-            acc_rate = run_mcmc_evaluation(compiled_model, prior, total_n=10000, batch_size=CONFIG['batch_size'], )
+
+            # 🌟 修改：接收多出来的期望值和误差
+            acc_rate, phi_means, phi_errs = run_mcmc_evaluation(
+                compiled_model, prior, total_n=20000, batch_size=CONFIG['batch_size']
+            )
+
             print(f"📊 当前物理接受率: {acc_rate:.2%}")
+
+            # 🌟 新增：按格式打印 1~5 次方的期望值
+            print("------ Phi Powers Expectation ------")
+            for p in range(1, 6):
+                print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
+
             print(f"{'=' * 50}\n")
 
             for m in target_milestones:
@@ -566,7 +648,7 @@ def train():
                     torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                                'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss,
+                                'loss': bare_loss_val, 'best_loss': best_loss, 'history_loss': history_loss,
                                 'ema_loss': ema_loss,
                                 'achieved_milestones': achieved_milestones},
                                milestone_path)
@@ -576,11 +658,12 @@ def train():
                 torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                            'loss': loss_val,
+                            'loss': bare_loss_val,
                             'best_loss': best_loss,
                             'history_loss': history_loss,
                             'ema_loss': ema_loss, }, 'mcmc_success_' + checkpoint_path)
-                print(f"🎉 成功达标！接受率已达到 {acc_rate:.2%} (>= {CONFIG['target_acc_ratio']:.0%})，提前结束训练阶段！")
+                print(
+                    f"🎉 成功达标！接受率已达到 {acc_rate:.2%} (>= {CONFIG['target_acc_ratio']:.0%})，提前结束训练阶段！")
                 break
 
     print("✅ 训练流水线结束！")

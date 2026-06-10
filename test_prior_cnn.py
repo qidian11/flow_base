@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from prior_cnn_macro_z2 import  FlowModel, FreeFieldPrior, compute_action, CONFIG, device
+from prior_cnn_micro_z2 import  FlowModel, FreeFieldPrior, compute_action, CONFIG, device
 # from aligned_prior_cnn import FlowModel, FreeFieldPrior, compute_action, CONFIG, device  # 复用你之前的定义
 # from attention_plus import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
 # from prior_cnn_net import FlowModel, FreeFieldPrior, compute_action, CONFIG, device

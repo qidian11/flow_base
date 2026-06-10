@@ -62,6 +62,7 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
+    'type': 'prior_cnn_micro_z2',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -69,19 +70,20 @@ CONFIG = {
     'lr': 1e-3,
     'use_scheduler': True,
     'scheduler_min': 1e-5,
-    'iterations': 25000,
+    'iterations': 40000,          # 🌟 修改：总步数改为 35000 (25000 + 10000)
+    'scheduler_steps': 35000,     # 🌟 新增：前多少步使用调度器
     'warmup_steps': 100.0,
     'target_acc_ratio': 0.78,
     # 🌟 修改点 1：精确控制 lambda_sym 的生效区间
     'lambda_sym_max': 1.0,        # 惩罚系数的最大值
-    'sym_warmup_start': 3000,     # 小于这个步数时，lambda_sym 严格为 0
-    'sym_warmup_end': 8000,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
+    'sym_warmup_start': 0,     # 小于这个步数时，lambda_sym 严格为 0
+    'sym_warmup_end': 100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
 
     'cnn_coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 32,
+    'hidden_channels': 16,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -361,13 +363,16 @@ def asymmetric_soft_clamp(x, min_val, max_val):
 
 
 # ==========================================
-# 6. 一体化评估核心
+# 6. 一体化评估核心 (修改版：增加 phi^1 到 phi^5 的在线期望计算)
 # ==========================================
 def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
     model.eval()
     total_n = (total_n // batch_size) * batch_size
 
     dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
+
+    # 🌟 新增：预分配 Tensor 以存储所有的提案构型
+    all_phis = torch.empty((total_n, 1, CONFIG['L'], CONFIG['L']), dtype=dtype, device=device)
     all_s = torch.empty(total_n, dtype=dtype, device=device)
     all_log_qs = torch.empty(total_n, dtype=dtype, device=device)
 
@@ -380,28 +385,56 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
             # MCMC 验证阶段直接正常采样，无需引入对立样本
             phi, log_det_J = model(z, dummy_progress)
 
+            # 🌟 新增：记录下所有的提案 phi
+            all_phis[i:i + current_batch] = phi
             all_s[i:i + current_batch] = compute_action(phi)
             all_log_qs[i:i + current_batch] = log_p_z - log_det_J
 
     accepted_count = 0
+    curr_phi = all_phis[0]
     curr_s = all_s[0]
     curr_log_q = all_log_qs[0]
 
     log_rands = torch.log(torch.rand(total_n, device=device, dtype=dtype))
 
+    # 🌟 新增：记录马尔可夫链中的每一个真实状态，用于后续计算观测值
+    chain_phis = torch.empty_like(all_phis)
+    chain_phis[0] = curr_phi
+
     for i in range(1, total_n):
+        prop_phi = all_phis[i]
         prop_s = all_s[i]
         prop_log_q = all_log_qs[i]
 
         log_acc_ratio = (-prop_s - prop_log_q) - (-curr_s - curr_log_q)
 
         if log_rands[i] < log_acc_ratio:
+            curr_phi = prop_phi
             curr_s = prop_s
             curr_log_q = prop_log_q
             accepted_count += 1
 
+        # 记录当前 MCMC 步的构型
+        chain_phis[i] = curr_phi
+
+    # 🌟 新增：计算 phi^1 到 phi^5 的在线期望和朴素误差
+    phi_powers_mean = []
+    phi_powers_err = []
+
+    for power in range(1, 6):
+        # 先求空间维度的均值，得到时间序列 [total_n]
+        pow_seq = (chain_phis ** power).mean(dim=(2, 3)).squeeze()
+        # 求马尔可夫链的期望值
+        mean_val = pow_seq.mean().item()
+        # 朴素标准误 (这里是在线监控，不作复杂的 binning 去相关)
+        err_val = (pow_seq.std() / math.sqrt(total_n)).item()
+
+        phi_powers_mean.append(mean_val)
+        phi_powers_err.append(err_val)
+
     model.train()
-    return accepted_count / (total_n - 1)
+    # 🌟 修改：返回接受率的同时，返回期望值和误差列表
+    return accepted_count / (total_n - 1), phi_powers_mean, phi_powers_err
 
 
 # ==========================================
@@ -452,7 +485,7 @@ def train():
     if CONFIG.get('use_scheduler', True):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=CONFIG['iterations'],
+            T_max=CONFIG['scheduler_steps'],  # 🌟 修改：由 CONFIG['iterations'] 改为 CONFIG['scheduler_steps']
             eta_min=CONFIG['scheduler_min'],
             last_epoch=start_iteration - 1 if start_iteration > 1 else -1
         )
@@ -488,8 +521,10 @@ def train():
         loss_kl = torch.mean((log_p_z - log_det_J) + compute_action(phi))
 
         # 🌟 核心修改 3：计算 Z_2 软限制 Symmetry Loss
+        # 🌟 修正：补偿体积因子，对齐 Action 的广延量级
+        V = CONFIG['L'] * CONFIG['L']
         phi_a, phi_b = torch.chunk(phi, 2, dim=0)
-        loss_sym = F.mse_loss(phi_b, -phi_a)
+        loss_sym = V * F.mse_loss(phi_b, -phi_a)
 
         # 🌟 修改点 2：分段计算延迟的 lambda_sym
         warmup_start = CONFIG.get('sym_warmup_start', 10000)
@@ -517,20 +552,36 @@ def train():
         else:
             optimizer.step()
 
-        if scheduler: scheduler.step()
+        # 🌟 修改：只在前 25000 步推进 scheduler，之后停止推进并维持当前学习率
+        if scheduler and iteration <= CONFIG['scheduler_steps']:
+            scheduler.step()
+        elif iteration == CONFIG['scheduler_steps'] + 1:
+            print(
+                f"🔄 调度器已完成前 {CONFIG['scheduler_steps']} 步降速，后续 10000 步学习率将固定在: {optimizer.param_groups[0]['lr']:.2e}")
 
-        loss_val = loss.item()
-        history_loss.append(loss_val)
-        ema_loss = loss_val if ema_loss is None else 0.95 * ema_loss + 0.05 * loss_val
+        # ==========================================
+        # 🌟 关键修改 1：将记录的标量指标全部提取为裸 Loss
+        # ==========================================
+        bare_loss_val = loss_kl.item()
+        sym_loss_val = loss_sym.item()
+
+        # 计算 裸Loss 的平滑值
+        ema_loss = bare_loss_val if ema_loss is None else 0.5 * ema_loss + 0.5 * bare_loss_val
+
+        history_loss.append(bare_loss_val)
 
         if iteration % 100 == 0:
-            # 打印时拆分显示 KL 和 Sym Loss，方便监控
+            # 打印时清晰地展示 总Loss、裸KL 和 平滑裸KL
             print(
-                f"迭代 {iteration:6d}/{CONFIG['iterations']} | 总Loss: {loss_val:.4f} (KL: {loss_kl.item():.4f}, Sym: {loss_sym.item():.4f}) | 平滑 Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                f"迭代 {iteration:6d}/{CONFIG['iterations']} | "
+                f"总Loss: {loss:.4f} (裸KL: {bare_loss_val:.4f}, Sym: {sym_loss_val:.4f}) | "
+                f"平滑裸Loss: {ema_loss:.4f} | Best裸: {best_loss:.4f} | "
+                f"λ_sym: {current_lambda_sym:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss,
+                        'loss': bare_loss_val, 'best_loss': best_loss,
                         'history_loss': history_loss, 'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        checkpoint_path)
@@ -540,15 +591,29 @@ def train():
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss, 'ema_loss': ema_loss,
+                        'loss': bare_loss_val, 'best_loss': best_loss,
+                        'history_loss': history_loss,
+                        'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        save_path)
 
-        if iteration >= 10000 and iteration % 2000 == 0:
+        # if iteration >= 10000 and iteration % 2000 == 0:
+        if iteration % 100 == 0:
             print(f"\n{'=' * 50}")
             print(f"🚀 [迭代 {iteration}] 触发 MCMC 在线验证 (样本量: 10000)...")
-            acc_rate = run_mcmc_evaluation(compiled_model, prior, total_n=10000, batch_size=CONFIG['batch_size'], )
+
+            # 🌟 修改：接收多出来的期望值和误差
+            acc_rate, phi_means, phi_errs = run_mcmc_evaluation(
+                compiled_model, prior, total_n=10000, batch_size=CONFIG['batch_size']
+            )
+
             print(f"📊 当前物理接受率: {acc_rate:.2%}")
+
+            # 🌟 新增：按格式打印 1~5 次方的期望值
+            print("------ Phi Powers Expectation ------")
+            for p in range(1, 6):
+                print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
+
             print(f"{'=' * 50}\n")
 
             for m in target_milestones:
@@ -565,7 +630,7 @@ def train():
                     torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                                'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss,
+                                'loss': bare_loss_val, 'best_loss': best_loss, 'history_loss': history_loss,
                                 'ema_loss': ema_loss,
                                 'achieved_milestones': achieved_milestones},
                                milestone_path)
@@ -575,7 +640,7 @@ def train():
                 torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                            'loss': loss_val,
+                            'loss': bare_loss_val,
                             'best_loss': best_loss,
                             'history_loss': history_loss,
                             'ema_loss': ema_loss, }, 'mcmc_success_' + checkpoint_path)

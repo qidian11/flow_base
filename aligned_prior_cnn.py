@@ -79,7 +79,7 @@ CONFIG = {
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 64,
+    'hidden_channels': 16,
     'double_precision': False,
     'use_multi_kernel': True,
     'multi_kernel_sizes': (3,),
@@ -377,13 +377,17 @@ def asymmetric_soft_clamp(x, min_val, max_val):
 
 
 # ==========================================
-# 6. 一体化评估核心
+# ==========================================
+# 6. 一体化评估核心 (修改版：增加 phi^1 到 phi^5 的在线期望计算)
 # ==========================================
 def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
     model.eval()
     total_n = (total_n // batch_size) * batch_size
 
     dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
+
+    # 🌟 新增：预分配 Tensor 以存储所有的提案构型
+    all_phis = torch.empty((total_n, 1, CONFIG['L'], CONFIG['L']), dtype=dtype, device=device)
     all_s = torch.empty(total_n, dtype=dtype, device=device)
     all_log_qs = torch.empty(total_n, dtype=dtype, device=device)
 
@@ -395,28 +399,56 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024):
             z, log_p_z = prior.sample(current_batch)
             phi, log_det_J = model(z, dummy_progress)
 
+            # 🌟 新增：记录下所有的提案 phi
+            all_phis[i:i + current_batch] = phi
             all_s[i:i + current_batch] = compute_action(phi)
             all_log_qs[i:i + current_batch] = log_p_z - log_det_J
 
     accepted_count = 0
+    curr_phi = all_phis[0]
     curr_s = all_s[0]
     curr_log_q = all_log_qs[0]
 
     log_rands = torch.log(torch.rand(total_n, device=device, dtype=dtype))
 
+    # 🌟 新增：记录马尔可夫链中的每一个真实状态，用于后续计算观测值
+    chain_phis = torch.empty_like(all_phis)
+    chain_phis[0] = curr_phi
+
     for i in range(1, total_n):
+        prop_phi = all_phis[i]
         prop_s = all_s[i]
         prop_log_q = all_log_qs[i]
 
         log_acc_ratio = (-prop_s - prop_log_q) - (-curr_s - curr_log_q)
 
         if log_rands[i] < log_acc_ratio:
+            curr_phi = prop_phi
             curr_s = prop_s
             curr_log_q = prop_log_q
             accepted_count += 1
 
+        # 记录当前 MCMC 步的构型
+        chain_phis[i] = curr_phi
+
+    # 🌟 新增：计算 phi^1 到 phi^5 的在线期望和朴素误差
+    phi_powers_mean = []
+    phi_powers_err = []
+
+    for power in range(1, 6):
+        # 先求空间维度的均值，得到时间序列 [total_n]
+        pow_seq = (chain_phis ** power).mean(dim=(2, 3)).squeeze()
+        # 求马尔可夫链的期望值
+        mean_val = pow_seq.mean().item()
+        # 朴素标准误 (这里是在线监控，不作复杂的 binning 去相关)
+        err_val = (pow_seq.std() / math.sqrt(total_n)).item()
+
+        phi_powers_mean.append(mean_val)
+        phi_powers_err.append(err_val)
+
     model.train()
-    return accepted_count / (total_n - 1)
+    # 🌟 修改：返回接受率的同时，返回期望值和误差列表
+    return accepted_count / (total_n - 1), phi_powers_mean, phi_powers_err
 
 
 # ==========================================
@@ -492,6 +524,13 @@ def train():
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
 
+        # 🌟 修改点：方案 A - 全局宏观磁化率惩罚 (Global Magnetization Penalty)
+        # 计算整个 Batch 内所有样本、所有格点的平均场值，并惩罚其平方
+        # 🌟 修正：补偿体积因子，对齐 Action 的广延量级
+        V = CONFIG['L'] * CONFIG['L']
+        batch_mag = torch.mean(phi)
+        loss_sym = V * (batch_mag ** 2)
+
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             print("⚠️ 捕获到 NaN 梯度！跳过本次更新。")
@@ -513,7 +552,12 @@ def train():
 
         if iteration % 100 == 0:
             print(
-                f"迭代 {iteration:6d}/{CONFIG['iterations']} | 瞬时 Loss: {loss_val:.4f} | 平滑 Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                f"迭代 {iteration:6d}/{CONFIG['iterations']} "
+                f"| 瞬时 Loss: {loss_val:.4f} "
+                f"| 平滑 Loss: {ema_loss:.4f} "
+                f"| Best: {best_loss:.4f} "
+                f"| sym loss: {loss_sym}"
+                f"| LR: {optimizer.param_groups[0]['lr']:.2e}")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
@@ -531,11 +575,23 @@ def train():
                         'achieved_milestones': achieved_milestones},
                        save_path)
 
-        if iteration >= 10000 and iteration % 2000 == 0:
+        # if iteration >= 10000 and iteration % 2000 == 0:
+        if iteration % 100 == 0:
             print(f"\n{'=' * 50}")
             print(f"🚀 [迭代 {iteration}] 触发 MCMC 在线验证 (样本量: 10000)...")
-            acc_rate = run_mcmc_evaluation(compiled_model, prior, total_n=10000, batch_size=CONFIG['batch_size'], )
+
+            # 🌟 修改：接收多出来的期望值和误差
+            acc_rate, phi_means, phi_errs = run_mcmc_evaluation(
+                compiled_model, prior, total_n=10000, batch_size=CONFIG['batch_size']
+            )
+
             print(f"📊 当前物理接受率: {acc_rate:.2%}")
+
+            # 🌟 新增：按格式打印 1~5 次方的期望值
+            print("------ Phi Powers Expectation ------")
+            for p in range(1, 6):
+                print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
+
             print(f"{'=' * 50}\n")
 
             for m in target_milestones:
