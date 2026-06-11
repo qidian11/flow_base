@@ -25,7 +25,7 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    layer_str = f"layers_{config['cnn_coupling_layers']}cnn"
+    layer_str = f"layers_{config['coupling_layers']}cnn"
     depth_str = f"depth_{config.get('branch_depth', 3)}"
 
     if config.get('use_multi_kernel', False):
@@ -35,9 +35,12 @@ def auto_find_latest_checkpoint(config):
     else:
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
+    # 🌟 修改点：动态读取网络类型前缀，默认兼容旧版的 'prior_cnn_macro_z2'
+    type_prefix = config.get('type', 'prior_cnn_micro_z2')
+
     base_pattern = (
-        f"prior_cnn_micro_z2_double_precision_*_"
-        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
+        f"{type_prefix}_double_precision_*_"
+        f"{config['L']}_coupling_layers_{(config['coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
@@ -47,14 +50,19 @@ def auto_find_latest_checkpoint(config):
         files = glob.glob(prefix + base_pattern)
         return sorted(files, key=os.path.getmtime, reverse=True)
 
+    # 依次按优先级寻找最新、最佳以及普通权重文件
     for file in get_sorted_files("latest_"):
         if is_valid_checkpoint(file): return file
+
     for file in get_sorted_files("best_"):
         if is_valid_checkpoint(file): return file
+
     for file in get_sorted_files(""):
         filename = os.path.basename(file)
+        # 这里排除了带有特定前缀的文件，严格匹配普通 .pt 权重
         if not filename.startswith(("latest_", "best_")) and is_valid_checkpoint(file):
             return file
+
     return None
 
 
@@ -68,6 +76,7 @@ CONFIG = {
     'lam': 5.113,
     'batch_size': 1024,
     'lr': 1e-3,
+    'use_z2_penalty': True,       # 🌟 新增：Z_2 宏观惩罚控制开关
     'use_scheduler': True,
     'scheduler_min': 1e-5,
     'iterations': 40000,          # 🌟 修改：总步数改为 35000 (25000 + 10000)
@@ -76,8 +85,8 @@ CONFIG = {
     'target_acc_ratio': 0.78,
     # 🌟 修改点 1：精确控制 lambda_sym 的生效区间
     'lambda_sym_max': 1.0,        # 惩罚系数的最大值
-    'sym_warmup_start': 0,     # 小于这个步数时，lambda_sym 严格为 0
-    'sym_warmup_end': 100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
+    'sym_warmup_start': 18000,     # 小于这个步数时，lambda_sym 严格为 0
+    'sym_warmup_end': 18100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
 
     'cnn_coupling_layers': 6,
     'kernel_size': 3,
@@ -101,14 +110,32 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-save_path = f"best_prior_cnn_micro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"prior_cnn_micro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_prior_cnn_micro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_prior_cnn_micro_z2_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+# 替换原本的 base_pattern
+base_pattern = (
+    f"{CONFIG.get('type', 'prior_cnn_micro_z2')}_double_precision_*_"
+    f"{CONFIG['L']}_coupling_layers_{(CONFIG['coupling_layers'])}_"
+    f"{k_str}_"
+    f"hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_"
+    f"iterations_*.pt"
+)
+
+# 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
+base_name = (f"{CONFIG.get('type', 'prior_cnn_micro_z2')}_double_precision_"
+             f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
+             f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
+             f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+
+# 在最前面拼接你要求的前缀 (best_, latest_, phi_ensemble_, loss_)
+save_path = f"best_{base_name}.pt"
+loss_save_path = f"loss_{base_name}.npy"  # 统一格式，把 loss 移到了最前面
+checkpoint_path = f"latest_{base_name}.pt"
+phi_ensemble_save_path = f"phi_ensemble_{base_name}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
 CONFIG['checkpoint_path'] = checkpoint_path
+# 🌟 [新增：物理可观测量] 专门保存每 100 步的接受率、phi 的期望值及误差
+CONFIG['observables_save_path'] = f"observables_{base_name}.npz"
 CONFIG['phi_ensemble_save_path'] = phi_ensemble_save_path
 
 dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
@@ -481,6 +508,27 @@ def train():
         best_loss = checkpoint.get('best_loss', min(history_loss) if history_loss else float('inf'))
         achieved_milestones = checkpoint.get('achieved_milestones', set())
 
+    # 👇 🌟 修改点 2：添加读取 MCMC 历史数据的逻辑
+    history_acc = []
+    history_phi_means = []
+    history_phi_errs = []
+    mcmc_steps = []
+    # 🌟 修改点：专门从可观测量文件中读取期望值和接受率
+    if os.path.exists(CONFIG['observables_save_path']):
+        try:
+            npz_data = np.load(CONFIG['observables_save_path'])
+            steps_array = npz_data['steps']
+            # 截断失效的未来数据
+            valid_idx = steps_array < start_iteration
+
+            mcmc_steps = steps_array[valid_idx].tolist()
+            history_acc = npz_data['acc'][valid_idx].tolist()
+            history_phi_means = npz_data['phi_means'][valid_idx].tolist()
+            history_phi_errs = npz_data['phi_errs'][valid_idx].tolist()
+            print(f"✅ 成功加载外部物理观测记录，已对齐至第 {start_iteration - 1} 步。")
+        except Exception as e:
+            print(f"⚠️ 无法读取 {CONFIG['observables_save_path']}，将重新开始记录观测指标。错误: {e}")
+
     scheduler = None
     if CONFIG.get('use_scheduler', True):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -520,27 +568,37 @@ def train():
         # 🌟 核心修改 2：计算基础物理 KL Loss
         loss_kl = torch.mean((log_p_z - log_det_J) + compute_action(phi))
 
-        # 🌟 核心修改 3：计算 Z_2 软限制 Symmetry Loss
-        # 🌟 修正：补偿体积因子，对齐 Action 的广延量级
-        V = CONFIG['L'] * CONFIG['L']
-        phi_a, phi_b = torch.chunk(phi, 2, dim=0)
-        loss_sym = V * F.mse_loss(phi_b, -phi_a)
+        # 🌟 修改点：引入开关控制的 Z_2 惩罚项
+        if CONFIG.get('use_z2_penalty', True):
+            warmup_start = CONFIG.get('sym_warmup_start', 10000)
+            warmup_end = CONFIG.get('sym_warmup_end', 13000)
 
-        # 🌟 修改点 2：分段计算延迟的 lambda_sym
-        warmup_start = CONFIG.get('sym_warmup_start', 10000)
-        warmup_end = CONFIG.get('sym_warmup_end', 13000)
+            # 1. 先进行时间步判断
+            if iteration <= warmup_start:
+                current_lambda_sym = 0.0
+                # 前期完全跳过重型计算，直接给个干净的标量，不构建计算图
+                loss_sym = torch.tensor(0.0, device=device, dtype=dtype)
+            else:
+                # 2. 只有过了临界点，才计算动态系数和 Loss
+                if iteration >= warmup_end:
+                    current_lambda_sym = CONFIG.get('lambda_sym_max', 1.0)
+                else:
+                    # 在 start 和 end 之间进行线性插值
+                    sym_progress = (iteration - warmup_start) / (warmup_end - warmup_start)
+                    current_lambda_sym = sym_progress * CONFIG.get('lambda_sym_max', 1.0)
 
-        if iteration <= warmup_start:
-            current_lambda_sym = 0.0
-        elif iteration >= warmup_end:
-            current_lambda_sym = CONFIG.get('lambda_sym_max', 1.0)
+                # 🌟 核心优化：将高开销的张量操作彻底移入 active 区间
+                V = CONFIG['L'] * CONFIG['L']
+                phi_a, phi_b = torch.chunk(phi, 2, dim=0)
+                loss_sym = 100 * V * F.mse_loss(phi_b, -phi_a)  # 100倍对立惩罚
+
+            # 3. 组合最终 Loss
+            loss = loss_kl + current_lambda_sym * loss_sym
         else:
-            # 在 start 和 end 之间进行线性插值
-            sym_progress = (iteration - warmup_start) / (warmup_end - warmup_start)
-            current_lambda_sym = sym_progress * CONFIG.get('lambda_sym_max', 1.0)
-
-            # 组合最终 Loss
-        loss = loss_kl + current_lambda_sym * loss_sym
+            # 如果开关关闭，惩罚项和系数均置零，直接使用裸 KL Loss
+            loss_sym = torch.tensor(0.0, device=device, dtype=dtype)
+            current_lambda_sym = 0.0
+            loss = loss_kl
 
         loss.backward()
 
@@ -578,6 +636,7 @@ def train():
                 f"平滑裸Loss: {ema_loss:.4f} | Best裸: {best_loss:.4f} | "
                 f"λ_sym: {current_lambda_sym:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
+
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
@@ -615,6 +674,18 @@ def train():
                 print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
 
             print(f"{'=' * 50}\n")
+
+            # 🌟 3. 将数据追加到列表中
+            mcmc_steps.append(iteration)
+            history_acc.append(acc_rate)
+            history_phi_means.append(phi_means)
+            history_phi_errs.append(phi_errs)
+            # 🌟 独立保存物理观测期望值数据
+            np.savez(CONFIG['observables_save_path'],
+                     steps=np.array(mcmc_steps),
+                     acc=np.array(history_acc),
+                     phi_means=np.array(history_phi_means),
+                     phi_errs=np.array(history_phi_errs))
 
             for m in target_milestones:
                 if acc_rate >= m and m not in achieved_milestones:

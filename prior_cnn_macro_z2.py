@@ -69,12 +69,13 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
-    'type':'prior_cnn_macro_z2',
+    'type':'prior_cnn_macro_z2_15000-15100',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
-    'batch_size': 1024,
+    'batch_size': 2048,
     'lr': 1e-3,
+    'use_z2_penalty': True,       # 🌟 新增：Z_2 宏观惩罚控制开关
     'use_scheduler': True,
     'scheduler_min': 5e-6,
     'iterations': 40000,          # 🌟 修改：总步数改为 35000 (25000 + 10000)
@@ -537,28 +538,33 @@ def train():
         # 基础物理 KL Loss
         loss_kl = torch.mean((log_p_z - log_det_J) + compute_action(phi))
 
-        # 🌟 修改点：方案 A - 全局宏观磁化率惩罚 (Global Magnetization Penalty)
-        # 计算整个 Batch 内所有样本、所有格点的平均场值，并惩罚其平方
-        # 🌟 修正：补偿体积因子，对齐 Action 的广延量级
-        V = CONFIG['L'] * CONFIG['L']
-        batch_mag = torch.mean(phi)
-        loss_sym = V * (batch_mag ** 2)
+        # 🌟 修改点：引入开关控制的 Z_2 惩罚项
+        if CONFIG.get('use_z2_penalty', True):
+            # 方案 A - 全局宏观磁化率惩罚 (补偿体积因子，对齐 Action)
+            V = CONFIG['L'] * CONFIG['L']
+            batch_mag = torch.mean(phi)
+            loss_sym = V * (batch_mag ** 2)
 
-        # 计算延迟生效的动态 lambda_sym
-        warmup_start = CONFIG.get('sym_warmup_start', 3000)
-        warmup_end = CONFIG.get('sym_warmup_end', 8000)
+            # 计算延迟生效的动态 lambda_sym
+            warmup_start = CONFIG.get('sym_warmup_start', 3000)
+            warmup_end = CONFIG.get('sym_warmup_end', 8000)
 
-        if iteration <= warmup_start:
-            current_lambda_sym = 0.0
-        elif iteration >= warmup_end:
-            current_lambda_sym = CONFIG.get('lambda_sym_max', 1.0)
+            if iteration <= warmup_start:
+                current_lambda_sym = 0.0
+            elif iteration >= warmup_end:
+                current_lambda_sym = CONFIG.get('lambda_sym_max', 1.0)
+            else:
+                # 在 start 和 end 之间进行线性插值
+                sym_progress = (iteration - warmup_start) / (warmup_end - warmup_start)
+                current_lambda_sym = sym_progress * CONFIG.get('lambda_sym_max', 1.0)
+
+            # 组合最终 Loss
+            loss = loss_kl + current_lambda_sym * loss_sym
         else:
-            # 在 start 和 end 之间进行线性插值
-            sym_progress = (iteration - warmup_start) / (warmup_end - warmup_start)
-            current_lambda_sym = sym_progress * CONFIG.get('lambda_sym_max', 1.0)
-
-        # 组合最终 Loss
-        loss = loss_kl + current_lambda_sym * loss_sym
+            # 如果开关关闭，惩罚项和系数均置零，直接使用裸 KL Loss
+            loss_sym = torch.tensor(0.0, device=device, dtype=dtype)
+            current_lambda_sym = 0.0
+            loss = loss_kl
 
         loss.backward()
 
