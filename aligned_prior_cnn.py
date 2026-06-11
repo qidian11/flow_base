@@ -25,7 +25,7 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    layer_str = f"layers_{config['cnn_coupling_layers']}cnn"
+    layer_str = f"layers_{config['coupling_layers']}cnn"
     depth_str = f"depth_{config.get('branch_depth', 3)}"
 
     if config.get('use_multi_kernel', False):
@@ -35,9 +35,12 @@ def auto_find_latest_checkpoint(config):
     else:
         k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
 
+    # 🌟 修改点：动态读取网络类型前缀，默认兼容旧版的 'prior_cnn_macro_z2'
+    type_prefix = config.get('type', 'aligned_prior_cnn')
+
     base_pattern = (
-        f"aligned_prior_cnn_double_precision_*_"
-        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
+        f"{type_prefix}_double_precision_*_"
+        f"{config['L']}_coupling_layers_{(config['coupling_layers'])}_"
         f"{k_str}_"
         f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
         f"iterations_*.pt"
@@ -47,14 +50,19 @@ def auto_find_latest_checkpoint(config):
         files = glob.glob(prefix + base_pattern)
         return sorted(files, key=os.path.getmtime, reverse=True)
 
+    # 依次按优先级寻找最新、最佳以及普通权重文件
     for file in get_sorted_files("latest_"):
         if is_valid_checkpoint(file): return file
+
     for file in get_sorted_files("best_"):
         if is_valid_checkpoint(file): return file
+
     for file in get_sorted_files(""):
         filename = os.path.basename(file)
+        # 这里排除了带有特定前缀的文件，严格匹配普通 .pt 权重
         if not filename.startswith(("latest_", "best_")) and is_valid_checkpoint(file):
             return file
+
     return None
 
 
@@ -97,15 +105,23 @@ if CONFIG.get('use_multi_kernel', False):
 else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
-# 文件名修改为 aligned_prior_cnn
-save_path = f"best_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-loss_save_path = f"aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npy"
-checkpoint_path = f"latest_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.pt"
-phi_ensemble_save_path = f"phi_ensemble_aligned_prior_cnn_double_precision_{CONFIG['double_precision']}_{CONFIG['L']}_loss_history_coupling_layers_{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}.npz"
+
+base_name = (f"{CONFIG.get('type', 'aligned_prior_cnn')}_double_precision_"
+             f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
+             f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
+             f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+
+# 在最前面拼接你要求的前缀 (best_, latest_, phi_ensemble_, loss_)
+save_path = f"best_{base_name}.pt"
+loss_save_path = f"loss_{base_name}.npy"  # 统一格式，把 loss 移到了最前面
+checkpoint_path = f"latest_{base_name}.pt"
+phi_ensemble_save_path = f"phi_ensemble_{base_name}.npz"
 
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
 CONFIG['checkpoint_path'] = checkpoint_path
+# 🌟 [新增：物理可观测量] 专门保存每 100 步的接受率、phi 的期望值及误差
+CONFIG['observables_save_path'] = f"observables_{base_name}.npz"
 CONFIG['phi_ensemble_save_path'] = phi_ensemble_save_path
 
 dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
@@ -495,6 +511,26 @@ def train():
         best_loss = checkpoint.get('best_loss', min(history_loss) if history_loss else float('inf'))
         achieved_milestones = checkpoint.get('achieved_milestones', set())
 
+    history_acc = []
+    history_phi_means = []
+    history_phi_errs = []
+    mcmc_steps = []
+    # 🌟 修改点：专门从可观测量文件中读取期望值和接受率
+    if os.path.exists(CONFIG['observables_save_path']):
+        try:
+            npz_data = np.load(CONFIG['observables_save_path'])
+            steps_array = npz_data['steps']
+            # 截断失效的未来数据
+            valid_idx = steps_array < start_iteration
+
+            mcmc_steps = steps_array[valid_idx].tolist()
+            history_acc = npz_data['acc'][valid_idx].tolist()
+            history_phi_means = npz_data['phi_means'][valid_idx].tolist()
+            history_phi_errs = npz_data['phi_errs'][valid_idx].tolist()
+            print(f"✅ 成功加载外部物理观测记录，已对齐至第 {start_iteration - 1} 步。")
+        except Exception as e:
+            print(f"⚠️ 无法读取 {CONFIG['observables_save_path']}，将重新开始记录观测指标。错误: {e}")
+
     scheduler = None
     if CONFIG.get('use_scheduler', True):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -593,6 +629,18 @@ def train():
                 print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
 
             print(f"{'=' * 50}\n")
+
+            # 🌟 3. 将数据追加到列表中
+            mcmc_steps.append(iteration)
+            history_acc.append(acc_rate)
+            history_phi_means.append(phi_means)
+            history_phi_errs.append(phi_errs)
+            # 🌟 独立保存物理观测期望值数据
+            np.savez(CONFIG['observables_save_path'],
+                     steps=np.array(mcmc_steps),
+                     acc=np.array(history_acc),
+                     phi_means=np.array(history_phi_means),
+                     phi_errs=np.array(history_phi_errs))
 
             for m in target_milestones:
                 if acc_rate >= m and m not in achieved_milestones:

@@ -69,7 +69,7 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
-    'type':'prior_cnn_macro_z2_15000-15100',
+    'type':'prior_cnn_macro_z2_18000-18100',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -84,8 +84,8 @@ CONFIG = {
     'target_acc_ratio': 0.78,
     # 🌟 修改点 1：精确控制 lambda_sym 的生效区间
     'lambda_sym_max': 1.0,        # 惩罚系数的最大值
-    'sym_warmup_start': 15000,     # 小于这个步数时，lambda_sym 严格为 0
-    'sym_warmup_end': 15100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
+    'sym_warmup_start': 18000,     # 小于这个步数时，lambda_sym 严格为 0
+    'sym_warmup_end': 18100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
 
     'coupling_layers': 6,
     'kernel_size': 3,
@@ -110,14 +110,6 @@ else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
 # 替换原本的 base_pattern
-base_pattern = (
-    f"{CONFIG.get('type', 'prior_cnn_macro_z2')}_double_precision_*_"
-    f"{CONFIG['L']}_coupling_layers_{(CONFIG['coupling_layers'])}_"
-    f"{k_str}_"
-    f"hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_"
-    f"iterations_*.pt"
-)
-
 # 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
 base_name = (f"{CONFIG.get('type', 'prior_cnn_macro_z2')}_double_precision_"
              f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
@@ -133,6 +125,8 @@ phi_ensemble_save_path = f"phi_ensemble_{base_name}.npz"
 CONFIG['save_path'] = save_path
 CONFIG['loss_save_path'] = loss_save_path
 CONFIG['checkpoint_path'] = checkpoint_path
+# 🌟 [新增：物理可观测量] 专门保存每 100 步的接受率、phi 的期望值及误差
+CONFIG['observables_save_path'] = f"observables_{base_name}.npz"
 CONFIG['phi_ensemble_save_path'] = phi_ensemble_save_path
 
 dtype = torch.float64 if CONFIG.get('double_precision', False) else torch.float32
@@ -505,6 +499,26 @@ def train():
         best_loss = checkpoint.get('best_loss', min(history_loss) if history_loss else float('inf'))
         achieved_milestones = checkpoint.get('achieved_milestones', set())
 
+    history_acc = []
+    history_phi_means = []
+    history_phi_errs = []
+    mcmc_steps = []
+    # 🌟 修改点：专门从可观测量文件中读取期望值和接受率
+    if os.path.exists(CONFIG['observables_save_path']):
+        try:
+            npz_data = np.load(CONFIG['observables_save_path'])
+            steps_array = npz_data['steps']
+            # 截断失效的未来数据
+            valid_idx = steps_array < start_iteration
+
+            mcmc_steps = steps_array[valid_idx].tolist()
+            history_acc = npz_data['acc'][valid_idx].tolist()
+            history_phi_means = npz_data['phi_means'][valid_idx].tolist()
+            history_phi_errs = npz_data['phi_errs'][valid_idx].tolist()
+            print(f"✅ 成功加载外部物理观测记录，已对齐至第 {start_iteration - 1} 步。")
+        except Exception as e:
+            print(f"⚠️ 无法读取 {CONFIG['observables_save_path']}，将重新开始记录观测指标。错误: {e}")
+
     scheduler = None
     if CONFIG.get('use_scheduler', True):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -639,6 +653,18 @@ def train():
                 print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
 
             print(f"{'=' * 50}\n")
+
+            # 🌟 3. 将数据追加到列表中
+            mcmc_steps.append(iteration)
+            history_acc.append(acc_rate)
+            history_phi_means.append(phi_means)
+            history_phi_errs.append(phi_errs)
+            # 🌟 独立保存物理观测期望值数据
+            np.savez(CONFIG['observables_save_path'],
+                     steps=np.array(mcmc_steps),
+                     acc=np.array(history_acc),
+                     phi_means=np.array(history_phi_means),
+                     phi_errs=np.array(history_phi_errs))
 
             for m in target_milestones:
                 if acc_rate >= m and m not in achieved_milestones:
