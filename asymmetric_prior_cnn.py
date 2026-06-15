@@ -25,21 +25,23 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    layer_str = f"layers_{config['cnn_coupling_layers']}cnn"
-    depth_str = f"depth_{config.get('branch_depth', 3)}"
-
-    if config.get('use_multi_kernel', False):
-        sizes_str = '_'.join(map(str, config['multi_kernel_sizes']))
-        dilations_str = '_'.join(map(str, config.get('multi_kernel_dilations', (1, 1, 1))))
-        k_str = f"multi_k_{sizes_str}_dil_{dilations_str}_{depth_str}_{layer_str}"
+    # 重复一遍感受野字符串的生成逻辑
+    if config.get('s_use_multi_kernel', True):
+        s_k_str = '_'.join(map(str, config.get('s_kernel_sizes', (3, 3))))
+        s_dil_str = '_'.join(map(str, config.get('s_dilations', (1, 2))))
+        s_rf_str = f"sk_{s_k_str}_sdil_{s_dil_str}"
     else:
-        k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
+        s_rf_str = f"sk_{config.get('s_kernel_sizes', (3,))[0]}_sdil_1"
 
+    t_rf_str = f"tk_{config.get('t_kernel_size', 3)}"
+
+    # 🌟 修改匹配模式
     base_pattern = (
-        f"{config.get('type', 'aligned_prior_cnn')}_double_precision_*_"
-        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
-        f"{k_str}_"
-        f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
+        f"{config.get('type', 'asymmetric_prior_cnn')}_double_precision_*_"
+        f"{config['L']}_coupling_layers_{config['cnn_coupling_layers']}_depth_*_"
+        f"s_ch_{config.get('s_channels', 128)}_t_ch_{config.get('t_channels', 32)}_"
+        f"s_ly_{config.get('s_layers', 4)}_t_ly_{config.get('t_layers', 2)}_"
+        f"{s_rf_str}_{t_rf_str}_"  # 匹配感受野
         f"iterations_*.pt"
     )
 
@@ -67,50 +69,65 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
-    'type': 'aligned_prior_cnn_96',
+    'type': 'asymmetric_prior_cnn',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
     'batch_size': 512,
     'lr': 1e-3,
     'use_scheduler': True,
-    'scheduler_min': 5e-6,
+    'scheduler_min': 1e-5,
     'iterations': 60000,          # 🌟 修改：总步数改为 35000 (25000 + 10000)
     'scheduler_steps': 35000,     # 🌟 新增：前多少步使用调度器
-    'warmup_steps': 100.0,
+    # 'warmup_steps': 18000,      # 废弃
     'target_acc_ratio': 0.78,
 
     # 🌟 新增：显式 Z_2 对称性强制开关
     'enforce_z2_sym': False,        # 是否开启严格对称
     'sym_start_iter': 30000,       # 在第几步之后开启
 
+# 🌟 核心：非对称参数配置
+    's_channels': 96,   # s 网络的通道数
+    't_channels': 32,    # t 网络的通道数
+    's_layers': 3,       # s 网络的隐藏层数
+    't_layers': 2,       # t 网络的隐藏层数
+
     'cnn_coupling_layers': 6,  # 严格对齐，改为 6 层，依靠网络复用进行 12 次前向
-    'kernel_size': 3,
-    'hidden_layers': 4,
     'branch_depth': 2,
-    'hidden_channels': 96,
-    'double_precision': True,
-    'use_multi_kernel': True,
-    'multi_kernel_sizes': (3,),
-    'multi_kernel_dilations': (1,),
+    'double_precision': False,
+    # 🌟 2. 感受野 (Receptive Field) 非对称配置
+    's_use_multi_kernel': True,
+    's_kernel_sizes': (3, 3),   # s 网络的卷积核组合
+    's_dilations': (1, 2),      # s 网络的空洞率组合 (负责捕捉长程关联)
+    't_kernel_size': 3,         # t 网络固定单核小感受野
 }
 
 total_coupling_layers = CONFIG['cnn_coupling_layers']
 layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn"
 depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
 
-if CONFIG.get('use_multi_kernel', False):
-    sizes_str = '_'.join(map(str, CONFIG['multi_kernel_sizes']))
-    dilations_str = '_'.join(map(str, CONFIG.get('multi_kernel_dilations', (1, 1, 1))))
-    k_str = f"multi_k_{sizes_str}_dil_{dilations_str}_{depth_str}_{layer_str}"
+# ==========================================
+# 动态生成文件名核心
+# ==========================================
+# 提取 s 网络的感受野特征
+if CONFIG.get('s_use_multi_kernel', True):
+    s_k_str = '_'.join(map(str, CONFIG.get('s_kernel_sizes', (3, 3))))
+    s_dil_str = '_'.join(map(str, CONFIG.get('s_dilations', (1, 2))))
+    s_rf_str = f"sk_{s_k_str}_sdil_{s_dil_str}"
 else:
-    k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
+    s_rf_str = f"sk_{CONFIG.get('s_kernel_sizes', (3,))[0]}_sdil_1"
 
-# 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
-base_name = (f"{CONFIG.get('type', 'aligned_prior_cnn')}_double_precision_"
-             f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
-             f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
-             f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+# 提取 t 网络的感受野特征
+t_rf_str = f"tk_{CONFIG.get('t_kernel_size', 3)}"
+
+# 🌟 拼接终极版 base_name
+base_name = (f"{CONFIG.get('type', 'asymmetric_prior_cnn')}_double_precision_"
+             f"{CONFIG.get('double_precision', True)}_{CONFIG['L']}_coupling_layers_"
+             f"{CONFIG['cnn_coupling_layers']}_depth_{CONFIG.get('branch_depth', 2)}_"
+             f"s_ch_{CONFIG.get('s_channels', 128)}_t_ch_{CONFIG.get('t_channels', 32)}_"
+             f"s_ly_{CONFIG.get('s_layers', 4)}_t_ly_{CONFIG.get('t_layers', 2)}_"
+             f"{s_rf_str}_{t_rf_str}_"  # 👈 这里加入了 s 和 t 的感受野参数
+             f"iterations_{CONFIG['iterations']}")
 
 # 在最前面拼接你要求的前缀 (best_, latest_, phi_ensemble_, loss_)
 save_path = f"best_{base_name}.pt"
@@ -230,31 +247,42 @@ class MultiScaleResBlock(nn.Module):
 
 
 class ConvContextNet(nn.Module):
-    def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
+    def __init__(self, s_channels=128, s_layers=4, s_use_multi_kernel=True,
+                 s_kernel_sizes=(3, 3), s_dilations=(1, 2),
+
+                 # 🌟 t 网络的专属配置 (轻步兵 + 局域视野)
+                 t_channels=32, t_layers=2,
+                 t_kernel_size=3,
+                 hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
                  multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
 
-        # 🌟 构造独立的子网络，向 bimodal_z_2 的 full_capacity_net 严格看齐
-        def build_independent_net():
-            layers = []
-            # 入口层：对齐 circular padding 和 bias=True，确保感受野和参数量完全一致
-            layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1, padding=1, padding_mode='circular', bias=True))
-            layers.append(nn.LeakyReLU(0.01))
-
-            for _ in range(num_hidden_layers):
-                if use_multi_kernel:
-                    layers.append(MultiScaleResBlock(hidden_channels, kernel_sizes=multi_kernel_sizes,
-                                                     dilations=multi_kernel_dilations, branch_depth=branch_depth))
+        # --- 构造 s 网络的闭包函数 ---
+        def build_s_net():
+            layers = [nn.Conv2d(1, s_channels, kernel_size=3, padding=1, padding_mode='circular'), nn.LeakyReLU(0.01)]
+            for _ in range(s_layers):
+                if s_use_multi_kernel:
+                    layers.append(MultiScaleResBlock(s_channels, kernel_sizes=s_kernel_sizes, dilations=s_dilations,
+                                                     branch_depth=branch_depth))
                 else:
-                    layers.append(ResBlock(hidden_channels, kernel_size=kernel_size, branch_depth=branch_depth))
-
-            # 🌟 出口层：移除冗余的 1x1 隐藏过渡层，直接降维输出 1 个通道 (s 或 t)
-            layers.append(nn.Conv2d(hidden_channels, 1, kernel_size=1, stride=1, padding=0, bias=True))
+                    layers.append(ResBlock(s_channels, kernel_size=s_kernel_sizes[0], branch_depth=branch_depth))
+            layers.append(nn.Conv2d(s_channels, 1, kernel_size=1))
             return nn.Sequential(*layers)
 
-        # 拆分为完全独立的 s 网络和 t 网络
-        self.s_net = build_independent_net()
-        self.t_net = build_independent_net()
+        # --- 构造 t 网络的闭包函数 (强制只用单核，剥夺其宏观感受野) ---
+        def build_t_net():
+            # t 网络为了保证局域性，严格限制 padding 和 kernel
+            t_pad = t_kernel_size // 2
+            layers = [nn.Conv2d(1, t_channels, kernel_size=t_kernel_size, padding=t_pad, padding_mode='circular'),
+                      nn.LeakyReLU(0.01)]
+            for _ in range(t_layers):
+                layers.append(ResBlock(t_channels, kernel_size=t_kernel_size, branch_depth=branch_depth))
+            layers.append(nn.Conv2d(t_channels, 1, kernel_size=1))
+            return nn.Sequential(*layers)
+
+        # 实例化完全异构的两个子网络
+        self.s_net = build_s_net()
+        self.t_net = build_t_net()
 
         self._initialize_weights()
 
@@ -321,41 +349,43 @@ class FlowModel(nn.Module):
 
         for _ in range(self.cnn_layers):
             self.context_nets.append(ConvContextNet(
-                hidden_channels=config['hidden_channels'], num_hidden_layers=config['hidden_layers'],
-                kernel_size=config['kernel_size'], use_multi_kernel=config.get('use_multi_kernel', False),
-                multi_kernel_sizes=config.get('multi_kernel_sizes', (3, 3)),
-                multi_kernel_dilations=config.get('multi_kernel_dilations', (1, 2)),
+                # 🌟 传入非对称配置
+                s_channels=config.get('s_channels', 128),
+                t_channels=config.get('t_channels', 32),
+                s_layers=config.get('s_layers', 4),
+                t_layers=config.get('t_layers', 2),
+                # 👇 🌟 关键修复：把原本旧的传参全部换成最新的 s_ 和 t_ 前缀参数
+                s_use_multi_kernel=config.get('s_use_multi_kernel', True),
+                s_kernel_sizes=config.get('s_kernel_sizes', (3, 3)),
+                s_dilations=config.get('s_dilations', (1, 2)),
+                t_kernel_size=config.get('t_kernel_size', 3),
                 branch_depth=config.get('branch_depth', 3)
             ))
 
-        if config.get('use_multi_kernel', False):
-            arch_info = f"多尺度: {config.get('multi_kernel_sizes')} | 空洞率: {config.get('multi_kernel_dilations')}"
+        # 🌟 修复：使用最新的非对称感受野参数
+        if config.get('s_use_multi_kernel', True):
+            s_arch = f"多尺度: {config.get('s_kernel_sizes', (3, 3))} | 空洞率: {config.get('s_dilations', (1, 2))}"
         else:
-            arch_info = f"单核: {config['kernel_size']}"
+            s_arch = f"单核: {config.get('s_kernel_sizes', (3,))[0]}"
+        t_arch = f"单核: {config.get('t_kernel_size', 3)}"
 
         print("=" * 70)
-        print(f"🌟 对齐版 Prior_CNN 物理流模型初始化完毕！")
-        print(f"👉 总耦合层数: {self.total_layers} 层 (双步复用, 特征通道数: {config['hidden_channels']})")
+        print(f"🌟 非对称 Prior_CNN 物理流模型初始化完毕！")
+        print(f"👉 总耦合层数: {self.total_layers} 层 (双步复用)")
         print(f"   │")
-        print(f"   ├─ [结构对齐] 网络不具备内部 Z_2 结构，全靠数据驱动学习")
-        print(f"      ├─ 内部隐藏层 (ResBlocks): {config['hidden_layers']} 层 / 耦合层")
-        print(f"      └─ 卷积网络配置: {arch_info} | 分支深度: {config.get('branch_depth', 3)}")
+        print(f"   ├─ [容量分配] s 网络: {config.get('s_channels', 64)} 通道, {config.get('s_layers', 4)} 层")
+        print(f"   │            t 网络: {config.get('t_channels', 32)} 通道, {config.get('t_layers', 2)} 层")
+        print(f"   ├─ [感受野]   s 网络: {s_arch}")
+        print(f"   │            t 网络: {t_arch}")
+        print(f"   └─ 分支深度: {config.get('branch_depth', 2)}")
         print("=" * 70)
 
     def step_warmup(self, progress):
         """只负责放宽边界，防爆盾的开关由外部的 .train() 和 .eval() 决定"""
-        if progress < 1.0:
-            self.s_bounds[0].fill_(-0.5 - 1.5 * progress)
-            self.s_bounds[1].fill_(4.0 + 4.0 * progress)
-            self.t_bounds[0].fill_(-15.0 - 15.0 * progress)
-            self.t_bounds[1].fill_(15.0 + 15.0 * progress)
-        else:
-            self.s_bounds[0].fill_(-100.0)
-            self.s_bounds[1].fill_(100.0)
-            self.t_bounds[0].fill_(-100.0)
-            self.t_bounds[1].fill_(100.0)
+        """🌟 已废弃：采用永久 Leaky Clamp 后，不再需要动态放宽边界"""
+        pass
 
-    def forward(self, z, progress=None, enforce_sym=False):
+    def forward(self, z, enforce_sym=False):
         phi = z
         log_det_jacobian = 0
 
@@ -382,14 +412,10 @@ class FlowModel(nn.Module):
                     st_out = net(phi_frozen)
                     s_out, t_out = st_out[:, 0:1, :, :], st_out[:, 1:2, :, :]
 
-                if self.training and progress is not None:
-                    is_warmup = (progress < 1.0).view(1, 1, 1, 1)
-
-                    s_clamped = asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
-                    t_clamped = torch.clamp(t_out, self.t_bounds[0], self.t_bounds[1])
-
-                    s_out = torch.where(is_warmup, s_clamped, s_out)
-                    t_out = torch.where(is_warmup, t_clamped, t_out)
+                # 👇 🌟 治本之道：永久无条件施加泄漏截断 (Leaky Clamp)
+                # 不管是训练还是评估，不管是第几步，永远兜住底线，同时保证梯度不断！
+                # s_out = leaky_asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
+                # t_out = leaky_clamp(t_out, self.t_bounds[0], self.t_bounds[1])
 
                 update_mask = 1.0 - current_mask
 
@@ -400,10 +426,21 @@ class FlowModel(nn.Module):
         return phi, log_det_jacobian
 
 
-def asymmetric_soft_clamp(x, min_val, max_val):
+# ==========================================
+# 🌟 治本神技：带有梯度泄漏的截断函数 (Leaky Clamp)
+# ==========================================
+def leaky_asymmetric_soft_clamp(x, min_val, max_val, leak=0.01):
+    """用于 s 网络的非对称软截断，超出边界后保留 0.01 的微弱斜率"""
     pos_val = max_val * torch.tanh(x / max_val)
     neg_val = abs(min_val) * torch.tanh(x / abs(min_val))
-    return torch.where(x >= 0, pos_val, neg_val)
+    soft_clamped = torch.where(x >= 0, pos_val, neg_val)
+    # 核心魔法：加上一层线性泄漏，保证梯度永远不为 0
+    return soft_clamped + leak * (x - soft_clamped)
+
+def leaky_clamp(x, min_val, max_val, leak=0.01):
+    """用于 t 网络的硬截断，超出边界后保留 0.01 的微弱斜率"""
+    hard_clamped = torch.clamp(x, min_val, max_val)
+    return hard_clamped + leak * (x - hard_clamped)
 
 
 # ==========================================
@@ -536,11 +573,20 @@ def train():
         start_iteration = checkpoint['iteration'] + 1
         # 👇 🌟 新增这段“无缝补偿”逻辑：
         # 如果当前已经跑过了退火阶段，直接把学习率锁定为你最新的底线
+        # 👇 🌟 修复版断点恢复逻辑：
         if start_iteration > CONFIG['scheduler_steps']:
+            # 情况 A：已经超过退火期，直接无缝锁定最低学习率
             for param_group in optimizer.param_groups:
                 param_group['lr'] = CONFIG['scheduler_min']
             print(
                 f"🔧 已超过退火期 ({CONFIG['scheduler_steps']}步)，无缝接入最新最低学习率: {CONFIG['scheduler_min']:.2e}")
+        else:
+            # 👇 🌟 核心修复：情况 B：还在退火期内。必须强制把 optimizer 的起点记忆洗回 CONFIG['lr']
+            # 否则会被断点里随机的历史学习率“劫持”，导致重新初始化的余弦曲线发生倒挂！
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = CONFIG['lr']
+                param_group['initial_lr'] = CONFIG['lr']
+            print(f"🔄 处于退火期内，已重置 initial_lr 为 {CONFIG['lr']:.2e}，以确保余弦曲线正确生成。")
         history_loss = checkpoint.get('history_loss', [])
         ema_loss = checkpoint.get('ema_loss', None)
         best_loss = checkpoint.get('best_loss', min(history_loss) if history_loss else float('inf'))
@@ -588,16 +634,16 @@ def train():
         optimizer.zero_grad()
         z, log_p_z = prior.sample(CONFIG['batch_size'])
 
-        warmup_steps = CONFIG['warmup_steps']
-        progress_val = min(iteration / warmup_steps, 1.0)
-        model.step_warmup(progress_val)
-        progress_tensor = torch.tensor(progress_val, device=device, dtype=dtype)
+        # warmup_steps = CONFIG['warmup_steps']
+        # progress_val = min(iteration / warmup_steps, 1.0)
+        # model.step_warmup(progress_val)
+        # progress_tensor = torch.tensor(progress_val, device=device, dtype=dtype)
 
         # 🌟 新增：动态判断当前是否需要开启强制对称性
         enforce_sym = CONFIG.get('enforce_z2_sym', False) and (iteration >= CONFIG.get('sym_start_iter', 0))
 
         # 🌟 修改：将 enforce_sym 传给模型
-        phi, log_det_J = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
+        phi, log_det_J = compiled_model(z, enforce_sym=enforce_sym)
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
 
@@ -662,10 +708,13 @@ def train():
         # ==========================================
         if iteration % 2000 == 0:
             # 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
-            base_name = (f"{CONFIG.get('type', 'aligned_prior_cnn')}_double_precision_"
-                         f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
-                         f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
-                         f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+            base_name = (f"{CONFIG.get('type', 'asymmetric_prior_cnn')}_double_precision_"
+                         f"{CONFIG.get('double_precision', True)}_{CONFIG['L']}_coupling_layers_"
+                         f"{CONFIG['cnn_coupling_layers']}_depth_{CONFIG.get('branch_depth', 2)}_"
+                         f"s_ch_{CONFIG.get('s_channels', 128)}_t_ch_{CONFIG.get('t_channels', 32)}_"
+                         f"s_ly_{CONFIG.get('s_layers', 4)}_t_ly_{CONFIG.get('t_layers', 2)}_"
+                         f"{s_rf_str}_{t_rf_str}_"  # 👈 这里加入了 s 和 t 的感受野参数
+                         f"iterations_{CONFIG['iterations']}")
             # 动态拼接带有 iteration 数字的文件名
             iter_checkpoint_path = f"iter_{iteration}_{base_name}.pt"
             print(f"💾 [按步保存] 正在保存第 {iteration} 步的权重至: {iter_checkpoint_path}")

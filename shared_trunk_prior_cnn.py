@@ -25,22 +25,17 @@ def is_valid_checkpoint(filepath):
 
 
 def auto_find_latest_checkpoint(config):
-    layer_str = f"layers_{config['cnn_coupling_layers']}cnn"
-    depth_str = f"depth_{config.get('branch_depth', 3)}"
-
-    if config.get('use_multi_kernel', False):
-        sizes_str = '_'.join(map(str, config['multi_kernel_sizes']))
-        dilations_str = '_'.join(map(str, config.get('multi_kernel_dilations', (1, 1, 1))))
-        k_str = f"multi_k_{sizes_str}_dil_{dilations_str}_{depth_str}_{layer_str}"
-    else:
-        k_str = f"kernel_size_{config['kernel_size']}_{depth_str}_{layer_str}"
+    tk_str = '_'.join(map(str, config.get('trunk_kernel_sizes', (3, 3))))
+    tdil_str = '_'.join(map(str, config.get('trunk_dilations', (1, 2))))
+    trunk_rf = f"trk_{tk_str}_dil_{tdil_str}"
 
     base_pattern = (
-        f"{config.get('type', 'aligned_prior_cnn')}_double_precision_*_"
-        f"{config['L']}_coupling_layers_{(config['cnn_coupling_layers'])}_"
-        f"{k_str}_"
-        f"hidden_layers_{config['hidden_layers']}_hidden_channels_{config['hidden_channels']}_"
-        f"iterations_*.pt"
+        f"{config.get('type', 'shared_trunk_prior_cnn')}_dp_*_"
+        f"L{config['L']}_c{config['cnn_coupling_layers']}_d*_"
+        f"TrCh{config.get('trunk_channels')}_Ly{config.get('trunk_layers')}_{trunk_rf}_"
+        f"Sh{config.get('s_head_channels')}L{config.get('s_head_layers')}_"
+        f"Th{config.get('t_head_channels')}L{config.get('t_head_layers')}_"
+        f"iter_*.pt"
     )
 
     def get_sorted_files(prefix):
@@ -64,17 +59,17 @@ def auto_find_latest_checkpoint(config):
 
 
 # ==========================================
-# 1. 物理参数配置 (严格对齐 Z_2 脚本)
+# 1. 物理参数配置
 # ==========================================
 CONFIG = {
-    'type': 'aligned_prior_cnn_96',
+    'type': 'shared_trunk_prior_cnn',  # 🌟 新命名：共享主干架构
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
     'batch_size': 512,
     'lr': 1e-3,
     'use_scheduler': True,
-    'scheduler_min': 5e-6,
+    'scheduler_min': 1e-5,
     'iterations': 60000,          # 🌟 修改：总步数改为 35000 (25000 + 10000)
     'scheduler_steps': 35000,     # 🌟 新增：前多少步使用调度器
     'warmup_steps': 100.0,
@@ -84,33 +79,42 @@ CONFIG = {
     'enforce_z2_sym': False,        # 是否开启严格对称
     'sym_start_iter': 30000,       # 在第几步之后开启
 
-    'cnn_coupling_layers': 6,  # 严格对齐，改为 6 层，依靠网络复用进行 12 次前向
-    'kernel_size': 3,
-    'hidden_layers': 4,
+    'cnn_coupling_layers': 6,
     'branch_depth': 2,
-    'hidden_channels': 96,
-    'double_precision': True,
-    'use_multi_kernel': True,
-    'multi_kernel_sizes': (3,),
-    'multi_kernel_dilations': (1,),
+    'double_precision': False,
+
+    # 🌟 核心一：共享主干网络 (Shared Trunk) - 负责提炼全局格点特征
+    'trunk_channels': 96,  # 主干通道数（提炼公共特征，不需要像纯非对称那样给到 128）
+    'trunk_layers': 3,  # 主干网络层数
+    'trunk_use_multi_kernel': True,
+    'trunk_kernel_sizes': (3, 3),  # 主干使用多尺度空洞卷积抓取长程关联
+    'trunk_dilations': (1, 2),
+
+    # 🌟 核心二：S 独立分支 (s_head) - 负责最终的物理拓扑拉伸
+    's_head_channels': 32,
+    's_head_layers': 1,  # 只需 1-2 层残差网络进行专属特化
+    's_head_kernel_size': 3,     # 👈 现在你可以自由指定 s 分支的卷积核了
+
+    # 🌟 核心三：T 独立分支 (t_head) - 负责微观局域平移
+    't_head_channels': 32,
+    't_head_layers': 1,  # 只需 1-2 层残差网络进行专属特化
+    't_kernel_size': 3,  # T 分支依然死死锁住 3x3 小感受野
 }
 
-total_coupling_layers = CONFIG['cnn_coupling_layers']
-layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn"
-depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
+# ==========================================
+# 动态生成文件名核心
+# ==========================================
+# 提取感受野特征
+tk_str = '_'.join(map(str, CONFIG.get('trunk_kernel_sizes', (3, 3))))
+tdil_str = '_'.join(map(str, CONFIG.get('trunk_dilations', (1, 2))))
+trunk_rf = f"trk_{tk_str}_dil_{tdil_str}"
 
-if CONFIG.get('use_multi_kernel', False):
-    sizes_str = '_'.join(map(str, CONFIG['multi_kernel_sizes']))
-    dilations_str = '_'.join(map(str, CONFIG.get('multi_kernel_dilations', (1, 1, 1))))
-    k_str = f"multi_k_{sizes_str}_dil_{dilations_str}_{depth_str}_{layer_str}"
-else:
-    k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
-
-# 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
-base_name = (f"{CONFIG.get('type', 'aligned_prior_cnn')}_double_precision_"
-             f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
-             f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
-             f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+base_name = (f"{CONFIG.get('type', 'shared_trunk_prior_cnn')}_dp_{CONFIG.get('double_precision', True)}_"
+             f"L{CONFIG['L']}_c{CONFIG['cnn_coupling_layers']}_d{CONFIG.get('branch_depth', 2)}_"
+             f"TrCh{CONFIG.get('trunk_channels')}_Ly{CONFIG.get('trunk_layers')}_{trunk_rf}_"
+             f"Sh{CONFIG.get('s_head_channels')}L{CONFIG.get('s_head_layers')}_"
+             f"Th{CONFIG.get('t_head_channels')}L{CONFIG.get('t_head_layers')}_"
+             f"iter_{CONFIG['iterations']}")
 
 # 在最前面拼接你要求的前缀 (best_, latest_, phi_ensemble_, loss_)
 save_path = f"best_{base_name}.pt"
@@ -192,35 +196,29 @@ class MultiScaleResBlock(nn.Module):
     def __init__(self, channels, kernel_sizes=(3, 5, 7), dilations=(1, 1, 1), branch_depth=3):
         super().__init__()
         self.channels = channels
-        assert len(kernel_sizes) == len(dilations), "卷积核数量和空洞率数量必须严格匹配！"
         self.branches = nn.ModuleList()
-        self.branch_pads = []
 
         for k, d in zip(kernel_sizes, dilations):
-            assert k % 2 != 0, f"多尺度卷积核必须均为奇数！当前输入了偶数核: {k}"
+            # 精准计算 padding 大小，配合 circular mode 完美保持平移不变性
             pad_size = d * (k - 1) // 2
-            self.branch_pads.append(pad_size)
-
             layers = nn.ModuleList()
             for _ in range(branch_depth):
-                layers.append(nn.Conv2d(channels, channels, kernel_size=k, dilation=d, padding=0, bias=False))
+                # 🚀 优化：利用 PyTorch 底层的 padding_mode='circular'，彻底抛弃 F.pad
+                layers.append(nn.Conv2d(channels, channels, kernel_size=k, dilation=d,
+                                        padding=pad_size, padding_mode='circular', bias=False))
                 layers.append(nn.LeakyReLU(0.01))
             self.branches.append(layers)
 
         self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=False)
 
-    def _initialize_weights(self):
-        nn.init.normal_(self.fusion_conv.weight, mean=0.0, std=0.01)
-
     def forward(self, x):
         outs = []
-        for branch, pad_size in zip(self.branches, self.branch_pads):
+        for branch in self.branches:
             out = x
-            pad_tuple = (pad_size, pad_size, pad_size, pad_size)
             for i in range(0, len(branch), 2):
                 conv_layer = branch[i]
                 act_layer = branch[i + 1]
-                out = F.pad(out, pad=pad_tuple, mode='circular')
+                # 🚀 优化：前向传播无比干净，没有任何额外的 Tensor 切片和拼接
                 out = act_layer(conv_layer(out))
             outs.append(out)
 
@@ -230,51 +228,77 @@ class MultiScaleResBlock(nn.Module):
 
 
 class ConvContextNet(nn.Module):
-    def __init__(self, hidden_channels=8, num_hidden_layers=4, kernel_size=3, use_multi_kernel=False,
-                 multi_kernel_sizes=(3, 5, 7), multi_kernel_dilations=(1, 1, 1), branch_depth=3):
+    def __init__(self,
+                 trunk_channels=64, trunk_layers=3,
+                 trunk_use_multi_kernel=True, trunk_kernel_sizes=(3, 3), trunk_dilations=(1, 2),
+                 s_head_channels=32, s_head_layers=1, s_head_kernel_size=3, # 👈 接收 s_kernel
+                 t_head_channels=32, t_head_layers=1, t_kernel_size=3,
+                 branch_depth=2):
         super().__init__()
 
-        # 🌟 构造独立的子网络，向 bimodal_z_2 的 full_capacity_net 严格看齐
-        def build_independent_net():
-            layers = []
-            # 入口层：对齐 circular padding 和 bias=True，确保感受野和参数量完全一致
-            layers.append(nn.Conv2d(1, hidden_channels, kernel_size=3, stride=1, padding=1, padding_mode='circular', bias=True))
-            layers.append(nn.LeakyReLU(0.01))
+        self.s_head_layers = s_head_layers
+        self.t_head_layers = t_head_layers
 
-            for _ in range(num_hidden_layers):
-                if use_multi_kernel:
-                    layers.append(MultiScaleResBlock(hidden_channels, kernel_sizes=multi_kernel_sizes,
-                                                     dilations=multi_kernel_dilations, branch_depth=branch_depth))
-                else:
-                    layers.append(ResBlock(hidden_channels, kernel_size=kernel_size, branch_depth=branch_depth))
+        # --- 🌟 1. 构造共享主干网络 (Shared Trunk) ---
+        trunk_list = [nn.Conv2d(1, trunk_channels, kernel_size=3, padding=1, padding_mode='circular'), nn.LeakyReLU(0.01)]
+        for _ in range(trunk_layers):
+            if trunk_use_multi_kernel:
+                trunk_list.append(MultiScaleResBlock(trunk_channels, kernel_sizes=trunk_kernel_sizes, dilations=trunk_dilations, branch_depth=branch_depth))
+            else:
+                trunk_list.append(ResBlock(trunk_channels, kernel_size=trunk_kernel_sizes[0], branch_depth=branch_depth))
+        self.trunk_net = nn.Sequential(*trunk_list)
 
-            # 🌟 出口层：移除冗余的 1x1 隐藏过渡层，直接降维输出 1 个通道 (s 或 t)
-            layers.append(nn.Conv2d(hidden_channels, 1, kernel_size=1, stride=1, padding=0, bias=True))
-            return nn.Sequential(*layers)
+        # --- 🌟 2. 构造 S 的独立分支 (支持 0 层直通) ---
+        s_pad = s_head_kernel_size // 2
+        if s_head_layers == 0:
+            # 如果为0，直接用一层卷积把 trunk 特征映射为1通道输出 (s)
+            self.s_head = nn.Conv2d(trunk_channels, 1, kernel_size=s_head_kernel_size, padding=s_pad, padding_mode='circular')
+        else:
+            s_head_list = [nn.Conv2d(trunk_channels, s_head_channels, kernel_size=s_head_kernel_size, padding=s_pad, padding_mode='circular'), nn.LeakyReLU(0.01)]
+            for _ in range(s_head_layers):
+                s_head_list.append(ResBlock(s_head_channels, kernel_size=s_head_kernel_size, branch_depth=branch_depth))
+            s_head_list.append(nn.Conv2d(s_head_channels, 1, kernel_size=1))
+            self.s_head = nn.Sequential(*s_head_list)
 
-        # 拆分为完全独立的 s 网络和 t 网络
-        self.s_net = build_independent_net()
-        self.t_net = build_independent_net()
+        # --- 🌟 3. 构造 T 的独立分支 (支持 0 层直通) ---
+        t_pad = t_kernel_size // 2
+        if t_head_layers == 0:
+            # 如果为0，直接用一层卷积把 trunk 特征映射为1通道输出 (t)
+            self.t_head = nn.Conv2d(trunk_channels, 1, kernel_size=t_kernel_size, padding=t_pad, padding_mode='circular')
+        else:
+            t_head_list = [nn.Conv2d(trunk_channels, t_head_channels, kernel_size=t_kernel_size, padding=t_pad, padding_mode='circular'), nn.LeakyReLU(0.01)]
+            for _ in range(t_head_layers):
+                t_head_list.append(ResBlock(t_head_channels, kernel_size=t_kernel_size, branch_depth=branch_depth))
+            t_head_list.append(nn.Conv2d(t_head_channels, 1, kernel_size=1))
+            self.t_head = nn.Sequential(*t_head_list)
 
         self._initialize_weights()
 
     def _initialize_weights(self):
-        # 初始化 s 网络：确保初始尺度收缩趋近于 1 (即 s=0)
-        nn.init.normal_(self.s_net[0].weight, mean=0, std=0.1)
-        nn.init.zeros_(self.s_net[-1].weight)
-        nn.init.zeros_(self.s_net[-1].bias)
+        nn.init.normal_(self.trunk_net[0].weight, mean=0, std=0.1)
 
-        # 初始化 t 网络：确保初始平移趋近于 0
-        nn.init.normal_(self.t_net[0].weight, mean=0, std=0.1)
-        nn.init.zeros_(self.t_net[-1].weight)
-        nn.init.zeros_(self.t_net[-1].bias)
+        # 智能适配 0 层和多层的 S 网络初始化
+        if self.s_head_layers == 0:
+            nn.init.zeros_(self.s_head.weight)
+            nn.init.zeros_(self.s_head.bias)
+        else:
+            nn.init.normal_(self.s_head[0].weight, mean=0, std=0.05)
+            nn.init.zeros_(self.s_head[-1].weight)
+            nn.init.zeros_(self.s_head[-1].bias)
+
+        # 智能适配 0 层和多层的 T 网络初始化
+        if self.t_head_layers == 0:
+            nn.init.zeros_(self.t_head.weight)
+            nn.init.zeros_(self.t_head.bias)
+        else:
+            nn.init.normal_(self.t_head[0].weight, mean=0, std=0.05)
+            nn.init.zeros_(self.t_head[-1].weight)
+            nn.init.zeros_(self.t_head[-1].bias)
 
     def forward(self, x):
-        # 分别进行独立前向计算
-        s_out = self.s_net(x)
-        t_out = self.t_net(x)
-
-        # 拼接为 (B, 2, H, W) 以便无缝接入外部 FlowModel 原有的拆分逻辑
+        shared_feat = self.trunk_net(x)
+        s_out = self.s_head(shared_feat)
+        t_out = self.t_head(shared_feat)
         return torch.cat([s_out, t_out], dim=1)
 
 
@@ -321,25 +345,32 @@ class FlowModel(nn.Module):
 
         for _ in range(self.cnn_layers):
             self.context_nets.append(ConvContextNet(
-                hidden_channels=config['hidden_channels'], num_hidden_layers=config['hidden_layers'],
-                kernel_size=config['kernel_size'], use_multi_kernel=config.get('use_multi_kernel', False),
-                multi_kernel_sizes=config.get('multi_kernel_sizes', (3, 3)),
-                multi_kernel_dilations=config.get('multi_kernel_dilations', (1, 2)),
-                branch_depth=config.get('branch_depth', 3)
+                trunk_channels=config.get('trunk_channels', 64),
+                trunk_layers=config.get('trunk_layers', 3),
+                trunk_use_multi_kernel=config.get('trunk_use_multi_kernel', True),
+                trunk_kernel_sizes=config.get('trunk_kernel_sizes', (3, 3)),
+                trunk_dilations=config.get('trunk_dilations', (1, 2)),
+
+                s_head_channels=config.get('s_head_channels', 32),
+                s_head_layers=config.get('s_head_layers', 1),
+
+                t_head_channels=config.get('t_head_channels', 32),
+                t_head_layers=config.get('t_head_layers', 1),
+                t_kernel_size=config.get('t_kernel_size', 3),
+
+                branch_depth=config.get('branch_depth', 2)
             ))
 
-        if config.get('use_multi_kernel', False):
-            arch_info = f"多尺度: {config.get('multi_kernel_sizes')} | 空洞率: {config.get('multi_kernel_dilations')}"
-        else:
-            arch_info = f"单核: {config['kernel_size']}"
-
+            # 控制台炫酷打印
         print("=" * 70)
-        print(f"🌟 对齐版 Prior_CNN 物理流模型初始化完毕！")
-        print(f"👉 总耦合层数: {self.total_layers} 层 (双步复用, 特征通道数: {config['hidden_channels']})")
+        print(f"🌟 Shared-Trunk (Y-Net) 物理流模型初始化完毕！")
+        print(f"👉 耦合层数: {self.total_layers} 层 (双步复用) | 分支深度: {config.get('branch_depth', 2)}")
         print(f"   │")
-        print(f"   ├─ [结构对齐] 网络不具备内部 Z_2 结构，全靠数据驱动学习")
-        print(f"      ├─ 内部隐藏层 (ResBlocks): {config['hidden_layers']} 层 / 耦合层")
-        print(f"      └─ 卷积网络配置: {arch_info} | 分支深度: {config.get('branch_depth', 3)}")
+        print(
+            f"   ├─ [共享主干] {config.get('trunk_channels')} 通道, {config.get('trunk_layers')} 层 (多尺度: {config.get('trunk_kernel_sizes')}, 空洞率: {config.get('trunk_dilations')})")
+        print(f"   ├─ [S 特化层] {config.get('s_head_channels')} 通道, {config.get('s_head_layers')} 层残差")
+        print(
+            f"   └─ [T 特化层] {config.get('t_head_channels')} 通道, {config.get('t_head_layers')} 层残差 (单核: {config.get('t_kernel_size')})")
         print("=" * 70)
 
     def step_warmup(self, progress):
@@ -662,10 +693,16 @@ def train():
         # ==========================================
         if iteration % 2000 == 0:
             # 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
-            base_name = (f"{CONFIG.get('type', 'aligned_prior_cnn')}_double_precision_"
-                         f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
-                         f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
-                         f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+            tk_str = '_'.join(map(str, CONFIG.get('trunk_kernel_sizes', (3, 3))))
+            tdil_str = '_'.join(map(str, CONFIG.get('trunk_dilations', (1, 2))))
+            trunk_rf = f"trk_{tk_str}_dil_{tdil_str}"
+
+            base_name = (f"{CONFIG.get('type', 'shared_trunk_prior_cnn')}_dp_{CONFIG.get('double_precision', True)}_"
+                         f"L{CONFIG['L']}_c{CONFIG['cnn_coupling_layers']}_d{CONFIG.get('branch_depth', 2)}_"
+                         f"TrCh{CONFIG.get('trunk_channels')}_Ly{CONFIG.get('trunk_layers')}_{trunk_rf}_"
+                         f"Sh{CONFIG.get('s_head_channels')}L{CONFIG.get('s_head_layers')}_"
+                         f"Th{CONFIG.get('t_head_channels')}L{CONFIG.get('t_head_layers')}_"
+                         f"iter_{CONFIG['iterations']}")
             # 动态拼接带有 iteration 数字的文件名
             iter_checkpoint_path = f"iter_{iteration}_{base_name}.pt"
             print(f"💾 [按步保存] 正在保存第 {iteration} 步的权重至: {iter_checkpoint_path}")
@@ -750,5 +787,7 @@ def train():
 
 if __name__ == "__main__":
     if CONFIG.get('double_precision', False): torch.set_default_dtype(torch.float64)
+
+    torch.backends.cudnn.benchmark = True
 
     final_model = train()

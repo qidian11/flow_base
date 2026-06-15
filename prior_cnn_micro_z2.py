@@ -70,7 +70,7 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (严格对齐 Z_2 脚本)
 # ==========================================
 CONFIG = {
-    'type': 'prior_cnn_micro_z2',
+    'type': 'prior_cnn_micro_z2_18000-18100',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -88,7 +88,7 @@ CONFIG = {
     'sym_warmup_start': 18000,     # 小于这个步数时，lambda_sym 严格为 0
     'sym_warmup_end': 18100,       # 在 start 和 end 之间线性增长，大于 end 后保持为 max
 
-    'cnn_coupling_layers': 6,
+    'coupling_layers': 6,
     'kernel_size': 3,
     'hidden_layers': 4,
     'branch_depth': 2,
@@ -99,8 +99,8 @@ CONFIG = {
     'multi_kernel_dilations': (1,),
 }
 
-total_coupling_layers = CONFIG['cnn_coupling_layers']
-layer_str = f"layers_{CONFIG['cnn_coupling_layers']}cnn"
+total_coupling_layers = CONFIG['coupling_layers']
+layer_str = f"layers_{CONFIG['coupling_layers']}cnn"
 depth_str = f"depth_{CONFIG.get('branch_depth', 3)}"
 
 if CONFIG.get('use_multi_kernel', False):
@@ -111,14 +111,6 @@ else:
     k_str = f"kernel_size_{CONFIG['kernel_size']}_{depth_str}_{layer_str}"
 
 # 替换原本的 base_pattern
-base_pattern = (
-    f"{CONFIG.get('type', 'prior_cnn_micro_z2')}_double_precision_*_"
-    f"{CONFIG['L']}_coupling_layers_{(CONFIG['coupling_layers'])}_"
-    f"{k_str}_"
-    f"hidden_layers_{CONFIG['hidden_layers']}_hidden_channels_{CONFIG['hidden_channels']}_"
-    f"iterations_*.pt"
-)
-
 # 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
 base_name = (f"{CONFIG.get('type', 'prior_cnn_micro_z2')}_double_precision_"
              f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
@@ -310,7 +302,7 @@ class FlowModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.L = config['L']
-        self.cnn_layers = config['cnn_coupling_layers']
+        self.cnn_layers = config['coupling_layers']
         self.total_layers = self.cnn_layers
         self.register_buffer('base_mask', create_checkerboard_mask(self.L))
         self.context_nets = nn.ModuleList()
@@ -590,7 +582,7 @@ def train():
                 # 🌟 核心优化：将高开销的张量操作彻底移入 active 区间
                 V = CONFIG['L'] * CONFIG['L']
                 phi_a, phi_b = torch.chunk(phi, 2, dim=0)
-                loss_sym = 100 * V * F.mse_loss(phi_b, -phi_a)  # 100倍对立惩罚
+                loss_sym = 10000 * V * F.mse_loss(phi_b, -phi_a)  # 100倍对立惩罚
 
             # 3. 组合最终 Loss
             loss = loss_kl + current_lambda_sym * loss_sym
@@ -655,6 +647,27 @@ def train():
                         'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        save_path)
+
+        # ==========================================
+        # 🌟 新增：每隔 1000 步保存一次带有当前 iteration 的检查点
+        # ==========================================
+        if iteration % 1000 == 0:
+            # 提取公共的文件名核心部分，把 CONFIG['type'] 作为核心部分的开头
+            base_name = (f"{CONFIG.get('type', 'aligned_prior_cnn')}_double_precision_"
+                         f"{CONFIG['double_precision']}_{CONFIG['L']}_coupling_layers_"
+                         f"{total_coupling_layers}_{k_str}_hidden_layers_{CONFIG['hidden_layers']}"
+                         f"_hidden_channels_{CONFIG['hidden_channels']}_iterations_{CONFIG['iterations']}")
+            # 动态拼接带有 iteration 数字的文件名
+            iter_checkpoint_path = f"iter_{iteration}_{base_name}.pt"
+            print(f"💾 [按步保存] 正在保存第 {iteration} 步的权重至: {iter_checkpoint_path}")
+            torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                        'loss': bare_loss_val, 'best_loss': best_loss,
+                        'history_loss': history_loss,
+                        'ema_loss': ema_loss,
+                        'achieved_milestones': achieved_milestones},
+                       iter_checkpoint_path)
 
         # if iteration >= 10000 and iteration % 2000 == 0:
         if iteration % 100 == 0:
