@@ -15,13 +15,6 @@ device = torch.device(
 )
 print(f"运行设备: {device}")
 
-# ==========================================
-# 🌟 [关键入口]：跨代继承权重路径
-# ==========================================
-# 如果你要把 6 层扩展为 8 层，请把这里填上你 6 层模型 best_ 或 latest_ 的真实绝对/相对路径！
-# 例如："iter_36000_shared_trunk_prior_cnn_dp_False_L14_c6_...pt"
-# 如果留空，代码会认为你想从零开始训练全新的 8 层网络。
-EXTEND_FROM_CHECKPOINT = ""
 
 
 def is_valid_checkpoint(filepath):
@@ -82,46 +75,66 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置 (已变更为 8 层)
 # ==========================================
 CONFIG = {
-    'type': 'shared_trunk_prior_cnn',
+    'type': 'add_shared_trunk_prior_cnn',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
     'batch_size': 512,
-    'lr': 1e-3,
+    'lr': 1e-4,
     'use_scheduler': True,
     'scheduler_min': 1e-5,
     # 🌟 注意：如果你旧模型已经跑到 36000 步，这里最好改成 60000 甚至 80000 以便让新层有空间训练
-    'iterations': 60000,
-    'scheduler_steps': 35000,
-    'warmup_steps': 3000.0,
+    'iterations': 90000,
+    'scheduler_steps': 20000,
+    'warmup_steps': 10000.0,
     'target_acc_ratio': 0.78,
 
     'enforce_z2_sym': False,
     'sym_start_iter': 30000,
 
-    # 🌟 统一收拢到 CONFIG 的新层扩展开关
+    # 🌟 [核心控制台]：层扩展与继承开关
     'enable_layer_expansion': True,
+    'extend_from_checkpoint': "latest_shared_trunk_prior_cnn_dp_False_L14_c6_d2_TrCh128x6_Ly3x6_trk_3_dil_1_Sh96x6L1x6_Th64x6L1x6_iter_60000.pt",  # 👈 在这里填入你要继承的旧模型绝对或相对路径
+
+    # 🌟 [自动状态机]：不要手动改！代码会通过正则和存档自动填入这里
+    'expansion_start_iter': 0,
+    'split_lr_at_layer': 0,
+    # 👇 🌟 新增：新层独立预热多少步之后，全网解冻协同训练？
+    'unfreeze_old_layers_after': 12000,
 
     # 🌟 扩展为 8 层
-    'cnn_coupling_layers': 8,
+    # 'cnn_coupling_layers': 8, 改为读取trunk_channels长度
     'branch_depth': 2,
     'double_precision': False,
 
     # 🌟 列表长度也全部补齐为 8 个元素
-    'trunk_channels': [24, 24, 24, 24, 24, 24, 24, 24],
+    'trunk_channels': [128, 128, 128, 128, 128, 128, 128, 128],
     'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3],
     'trunk_use_multi_kernel': True,
     'trunk_kernel_sizes': (3,),
     'trunk_dilations': (1,),
 
-    's_head_channels': [24, 24, 24, 24, 24, 24, 24, 24],
-    's_head_layers': [0, 0, 0, 0, 0, 0, 0, 0],
+    's_head_channels': [96, 96, 96, 96, 96, 96, 96, 96],
+    's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1],
     's_head_kernel_size': 3,
 
-    't_head_channels': [24, 24, 24, 24, 24, 24, 24, 24],
-    't_head_layers': [0, 0, 0, 0, 0, 0, 0, 0],
+    't_head_channels': [64, 64, 64, 64, 64, 64, 64, 64],
+    't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
 }
+
+# ==========================================
+# 🌟 [动态配置计算与安全断言]
+# ==========================================
+# 1. 强制 Single Source of Truth：层数由主干通道列表长度唯一决定
+CONFIG['cnn_coupling_layers'] = len(CONFIG['trunk_channels'])
+
+# 2. 防御性编程：严格检查所有涉及层数的列表，只要长度对不上，程序立刻在启动时自爆报错
+_list_keys_to_check = ['trunk_layers', 's_head_channels', 's_head_layers', 't_head_channels', 't_head_layers']
+for _k in _list_keys_to_check:
+    if _k in CONFIG and isinstance(CONFIG[_k], list):
+        assert len(CONFIG[_k]) == CONFIG['cnn_coupling_layers'], \
+            f"❌ 配置致命错误: 列表 '{_k}' 的长度 ({len(CONFIG[_k])}) 与 'trunk_channels' ({CONFIG['cnn_coupling_layers']}) 不一致！"
 
 tk_str = '_'.join(map(str, CONFIG.get('trunk_kernel_sizes', (3, 3))))
 tdil_str = '_'.join(map(str, CONFIG.get('trunk_dilations', (1, 2))))
@@ -489,11 +502,16 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
 # ==========================================
 # 7. 训练主循环 (🌟 兼容层堆叠的热插拔设计)
 # ==========================================
+# ==========================================
+# 7. 训练主循环 (🌟 全自动状态机、正则解析、热插拔支持)
+# ==========================================
 def train():
+    import re  # 引入正则匹配模块
+
     model = FlowModel(CONFIG).to(device)
     prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
-    if CONFIG['double_precision']:
+    if CONFIG.get('double_precision', False):
         model = model.double()
         prior = prior.double()
 
@@ -507,38 +525,52 @@ def train():
     target_milestones = sorted([0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75], reverse=True)
     achieved_milestones = set()
 
-    # 1. 尝试寻找存档
+    # 1. 获取要加载的存档路径 (全量从 CONFIG 获取)
     old_checkpoint_path = auto_find_latest_checkpoint(CONFIG)
-    if not old_checkpoint_path and EXTEND_FROM_CHECKPOINT and os.path.exists(EXTEND_FROM_CHECKPOINT):
-        old_checkpoint_path = EXTEND_FROM_CHECKPOINT
-        print(f"\n🔄 [加载入口]：正尝试从旧模型 [{EXTEND_FROM_CHECKPOINT}] 继承参数...")
+    if not old_checkpoint_path and CONFIG.get('extend_from_checkpoint') and os.path.exists(
+            CONFIG['extend_from_checkpoint']):
+        old_checkpoint_path = CONFIG['extend_from_checkpoint']
+        print(f"\n🔄 [加载入口]：正尝试从指定旧模型 [{old_checkpoint_path}] 继承参数...")
 
     is_expanding_layers = False
     loaded_layer_count = CONFIG['cnn_coupling_layers']
 
+    # ========================== [自动状态机：读取与对齐] ==========================
     if old_checkpoint_path and os.path.exists(old_checkpoint_path):
         print(f"\n从 {old_checkpoint_path} 读取并初始化网络...")
         checkpoint = torch.load(old_checkpoint_path, map_location=device)
-        clean_dict = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()}
 
-        # 动态解析旧模型的层数
+        # 尝试从存档中直接恢复扩层记忆 (解决中断后重新执行的问题)
+        if 'expansion_start_iter' in checkpoint: CONFIG['expansion_start_iter'] = checkpoint['expansion_start_iter']
+        if 'split_lr_at_layer' in checkpoint: CONFIG['split_lr_at_layer'] = checkpoint['split_lr_at_layer']
+
+        clean_dict = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()}
         old_layer_indices = [int(k.split('.')[1]) for k in clean_dict.keys() if k.startswith('context_nets.')]
         loaded_layer_count = max(old_layer_indices) + 1 if old_layer_indices else 0
 
-        # 核心兼容加载逻辑：只加载矩阵形状和名字严丝合缝对齐的部分
         current_dict = model.state_dict()
         filtered_dict = {k: v for k, v in clean_dict.items() if k in current_dict and v.shape == current_dict[k].shape}
         model.load_state_dict(filtered_dict, strict=False)
 
-        # 🌟 核心判断：从 CONFIG 字典中读取开关，并比对层数
+        # 核心判断：是否触发新增层生长模式
         if CONFIG.get('enable_layer_expansion', False) and (CONFIG['cnn_coupling_layers'] > loaded_layer_count):
             is_expanding_layers = True
+
+            # 神来之笔：利用正则自动从文件名提取最后步数，作为新层的原点
+            match = re.search(r'iter_(\d+)', old_checkpoint_path)
+            if match:
+                CONFIG['expansion_start_iter'] = int(match.group(1))
+                print(f"🕵️ [状态机] 自动探测：从文件名提取旧模型最终步数 -> {CONFIG['expansion_start_iter']}")
+            else:
+                CONFIG['expansion_start_iter'] = checkpoint.get('iteration', 0)
+
+            CONFIG['split_lr_at_layer'] = loaded_layer_count
+
             print(f"✨✨✨ 架构扩展模式已激活 ✨✨✨")
-            print(f"✅ 检测到旧模型为 {loaded_layer_count} 层，当前配置为 {CONFIG['cnn_coupling_layers']} 层。")
-            print(f"✅ 已成功复用旧层参数，新增的层已被自动执行 [恒等映射] (输出 s=0, t=0)。")
+            print(
+                f"✅ 检测到旧模型为 {loaded_layer_count} 层，当前配置为 {CONFIG['cnn_coupling_layers']} 层。已执行恒等映射！")
             start_iteration = checkpoint['iteration'] + 1
         else:
-            # 架构没变，或者没开开关，正常恢复状态
             start_iteration = checkpoint['iteration'] + 1
             print(f"✅ 正常恢复模型训练，当前层数: {CONFIG['cnn_coupling_layers']}")
 
@@ -547,30 +579,52 @@ def train():
         best_loss = checkpoint.get('best_loss', min(history_loss) if history_loss else float('inf'))
         achieved_milestones = checkpoint.get('achieved_milestones', set())
 
-    # 2. 动态分配优化器 (解决新旧层学习率饥饿和冲垮旧层的问题)
-    if is_expanding_layers:
+    # ========================== [动态分配优化器] ==========================
+    split_layer = CONFIG.get('split_lr_at_layer', 0)
+    if split_layer > 0 and split_layer < CONFIG['cnn_coupling_layers']:
         old_params, new_params = [], []
         for i, net in enumerate(model.context_nets):
-            if i < loaded_layer_count:
+            if i < split_layer:
                 old_params.extend(list(net.parameters()))
             else:
                 new_params.extend(list(net.parameters()))
 
-        # 旧层用极小学习率微调，新层用正常学习率
         optimizer = optim.Adam([
             {'params': old_params, 'lr': 1e-5},
             {'params': new_params, 'lr': CONFIG['lr']}
         ], eps=eps_val)
-        print(f"🔧 [优化器设置]：新旧层学习率已隔离保护。")
+        print(f"🔧 [优化器] 已在第 {split_layer} 层处隔离新旧层学习率 (旧层 1e-5, 新层 {CONFIG['lr']})。")
     else:
         optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'], eps=eps_val)
-        if old_checkpoint_path and os.path.exists(old_checkpoint_path):
+
+    if old_checkpoint_path and os.path.exists(old_checkpoint_path):
+        try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if CONFIG.get('double_precision', False):
-                for group in optimizer.param_groups: group['eps'] = 1e-15
-                for state in optimizer.state.values():
-                    for k, v in state.items():
-                        if isinstance(v, torch.Tensor) and v.is_floating_point(): state[k] = v.double()
+        except ValueError:
+            print(f"⚠️ [警告] 优化器组结构变动！已自动重置优化器状态 (切换学习率策略时的正常安全现象)。")
+
+        if CONFIG.get('double_precision', False):
+            for group in optimizer.param_groups: group['eps'] = 1e-15
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point(): state[k] = v.double()
+
+    # ========================== [调度器初始化] ==========================
+    scheduler = None
+    if CONFIG.get('use_scheduler', True):
+        exp_start = CONFIG.get('expansion_start_iter', 0)
+        if exp_start > 0:
+            remaining_steps = CONFIG['iterations'] - exp_start
+            current_step = start_iteration - exp_start
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining_steps, eta_min=CONFIG['scheduler_min'],
+                last_epoch=current_step - 1 if current_step > 1 else -1
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=CONFIG['scheduler_steps'], eta_min=CONFIG['scheduler_min'],
+                last_epoch=start_iteration - 1 if start_iteration > 1 else -1
+            )
 
     history_acc, history_phi_means, history_phi_errs, mcmc_steps = [], [], [], []
     if os.path.exists(CONFIG['observables_save_path']):
@@ -584,44 +638,55 @@ def train():
         except Exception:
             pass
 
-    scheduler = None
-    if CONFIG.get('use_scheduler', True):
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=CONFIG['scheduler_steps'], eta_min=CONFIG['scheduler_min'],
-            last_epoch=start_iteration - 1 if start_iteration > 1 else -1
-        )
-
     compiled_model = model
     model.train()
 
+    # ========================== [训练主循环] ==========================
     for iteration in range(start_iteration, CONFIG['iterations'] + 1):
+        # 👇 🌟 新增：全网自动解冻逻辑
+        exp_start = CONFIG.get('expansion_start_iter', 0)
+        unfreeze_delay = CONFIG.get('unfreeze_old_layers_after', 0)
+
+        if exp_start > 0 and unfreeze_delay > 0:
+            is_past_unfreeze = (iteration >= exp_start + unfreeze_delay)
+            # 如果到达了解冻节点，且检测到旧层学习率(组0)依然被压制在极小值，则立即对齐学习率
+            # 直接判断调度器的基准峰值是否尚未对齐，彻底免疫余弦曲线的当前位置干扰
+            if is_past_unfreeze and scheduler and scheduler.base_lrs[0] < scheduler.base_lrs[1]:
+                print(f"\n🔓 [全网解冻] 触发！新层已完成 {unfreeze_delay} 步独立预热。")
+                print(f"🚀 正在对齐新旧层学习率，开启全网协同联合优化...")
+
+                # 强行将旧层的学习率拉上来，与新层同步
+                optimizer.param_groups[0]['lr'] = optimizer.param_groups[1]['lr']
+
+                # 必须同步更新调度器底座，否则下一步又会被拉回去
+                if scheduler:
+                    scheduler.base_lrs[0] = scheduler.base_lrs[1]
+        # 👆 ==========================================
+
         optimizer.zero_grad()
         z, log_p_z = prior.sample(CONFIG['batch_size'])
 
-        # 🌟 修复后的 Warmup 逻辑
-        if is_expanding_layers:
-            steps_since_restart = iteration - start_iteration
-            progress_val = min(steps_since_restart / CONFIG['warmup_steps'], 1.0)
+        # 🌟 根据状态机严谨计算 Warmup
+        exp_start = CONFIG.get('expansion_start_iter', 0)
+        if exp_start > 0:
+            steps_since_restart = iteration - exp_start
+            progress_val = min(max(steps_since_restart, 0) / CONFIG['warmup_steps'], 1.0)
         else:
             progress_val = min(iteration / CONFIG['warmup_steps'], 1.0)
 
         model.step_warmup(progress_val)
-
         enforce_sym = CONFIG.get('enforce_z2_sym', False) and (iteration >= CONFIG.get('sym_start_iter', 0))
 
-        # 🌟 动态确定哪些层需要被施加边界保护
-        start_idx_for_warmup = loaded_layer_count if is_expanding_layers else 0
+        # 🌟 将边界保护精准锁定在扩层的起始层
+        start_idx_for_warmup = CONFIG.get('split_lr_at_layer', 0)
 
         phi, log_det_J = compiled_model(z,
-                                        torch.tensor(progress_val,
-                                                        device=device,
-                                                        dtype=train_dtype),
+                                        torch.tensor(progress_val, device=device, dtype=train_dtype),
                                         enforce_sym=enforce_sym,
                                         warmup_start_idx=start_idx_for_warmup)
 
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
-
         loss_sym = (CONFIG['L'] ** 2) * (torch.mean(phi) ** 2)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -631,44 +696,49 @@ def train():
         else:
             optimizer.step()
 
-        if scheduler and iteration <= CONFIG['scheduler_steps']:
-            scheduler.step()
+        if scheduler:
+            if exp_start > 0:
+                scheduler.step()  # 扩展模式下全局步进
+            elif iteration <= CONFIG['scheduler_steps']:
+                scheduler.step()
 
         loss_val = loss.item()
         history_loss.append(loss_val)
         ema_loss = loss_val if ema_loss is None else 0.95 * ema_loss + 0.05 * loss_val
 
+        # ========================== [状态机记忆保存机制] ==========================
+        checkpoint_dict = {
+            'iteration': iteration,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'loss': loss_val, 'best_loss': best_loss,
+            'history_loss': history_loss, 'ema_loss': ema_loss,
+            'achieved_milestones': achieved_milestones,
+            'expansion_start_iter': CONFIG.get('expansion_start_iter', 0),  # 👈 将记忆写入物理存档
+            'split_lr_at_layer': CONFIG.get('split_lr_at_layer', 0)  # 👈 将记忆写入物理存档
+        }
+
         if iteration % 100 == 0:
-            current_lr = optimizer.param_groups[-1]['lr']  # 打印新层/主层的学习率
+            current_lr = optimizer.param_groups[-1]['lr']
             print(f"迭代 {iteration:6d}/{CONFIG['iterations']} | Z_2: {'ON' if enforce_sym else 'OFF'} "
                   f"| 瞬时: {loss_val:.4f} | 平滑: {ema_loss:.4f} | Best: {best_loss:.4f} | sym: {loss_sym:.4f} | LR: {current_lr:.2e}")
-            torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss, 'ema_loss': ema_loss,
-                        'achieved_milestones': achieved_milestones}, CONFIG['checkpoint_path'])
+            torch.save(checkpoint_dict, CONFIG['checkpoint_path'])
 
         if ema_loss < best_loss and iteration >= 10000:
             best_loss = ema_loss
-            torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss, 'ema_loss': ema_loss,
-                        'achieved_milestones': achieved_milestones}, CONFIG['save_path'])
+            checkpoint_dict['best_loss'] = best_loss
+            torch.save(checkpoint_dict, CONFIG['save_path'])
 
         if iteration % 2000 == 0:
-            torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(), 'loss': loss_val, 'best_loss': best_loss},
-                       f"iter_{iteration}_{CONFIG['base_name']}.pt")
+            torch.save(checkpoint_dict, f"iter_{iteration}_{CONFIG['base_name']}.pt")
 
         if iteration >= 10000 and iteration % 5000 == 0:
             total_n = 50000 if iteration % 5000 == 0 else 100000
             print(f"\n{'=' * 50}\n🚀 [迭代 {iteration}] 触发 MCMC 在线验证 (样本量: {total_n})...")
-
             acc_rate, phi_means, phi_errs = run_mcmc_evaluation(compiled_model, prior, total_n=total_n,
                                                                 batch_size=CONFIG['batch_size'],
                                                                 enforce_sym=enforce_sym)
-
             print(f"📊 当前物理接受率: {acc_rate:.2%}")
             for p in range(1, 6): print(f"phi^{p}: {phi_means[p - 1]:.6f} ± {phi_errs[p - 1]:.6f}")
             print(f"{'=' * 50}\n")
@@ -685,9 +755,7 @@ def train():
                     print(f"⭐ 达成里程碑！接受率突破 {m:.0%}，正在保存专属模型...")
                     achieved_milestones.update([lm for lm in target_milestones if lm <= m])
                     base_ckpt = CONFIG['checkpoint_path'].replace('latest_', '')
-                    torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict()},
-                               f"acc_{int(m * 100)}percent_{base_ckpt}")
+                    torch.save(checkpoint_dict, f"acc_{int(m * 100)}percent_{base_ckpt}")
                     break
 
     print("✅ 训练流水线结束！")
@@ -695,6 +763,9 @@ def train():
 
 
 if __name__ == "__main__":
+    # 👇 🌟 新增：强制清理次正常数，防止 GPU 遇到梯度爆炸时软挂起卡死
+    torch.set_flush_denormal(True)
+
     if CONFIG.get('double_precision', False): torch.set_default_dtype(torch.float64)
     torch.backends.cudnn.benchmark = True
     final_model = train()
