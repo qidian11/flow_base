@@ -5,7 +5,8 @@ from matplotlib.ticker import MaxNLocator
 # from HMC_final import CONFIG
 # from prior_cnn_macro_z2 import CONFIG
 # from aligned_prior_cnn import CONFIG
-from prior_cnn_micro_z2 import CONFIG
+# from prior_cnn_micro_z2 import CONFIG
+from var_shared_trunk_prior import CONFIG
 
 def get_device(prefer="auto"):
     if prefer == "cuda" and torch.cuda.is_available():

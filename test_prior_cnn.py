@@ -1,16 +1,15 @@
 import torch
 import numpy as np
-from prior_cnn_micro_z2 import  FlowModel, FreeFieldPrior, compute_action, CONFIG, device
-# from aligned_prior_cnn import FlowModel, FreeFieldPrior, compute_action, CONFIG, device  # 复用你之前的定义
-# from attention_plus import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
-# from prior_cnn_net import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
+import os
+import time
+
+# 🌟 修改 1：确保从你最新的主网络文件中导入！
+from var_shared_trunk_prior import FlowModel, FreeFieldPrior, compute_action, CONFIG, device
 
 
 def load_trained_model(checkpoint_path):
     """加载保存的模型权重"""
-    model = FlowModel(
-        CONFIG
-    ).to(device)
+    model = FlowModel(CONFIG).to(device)
 
     if CONFIG.get('double_precision', False):
         model = model.double()
@@ -23,19 +22,13 @@ def load_trained_model(checkpoint_path):
     else:
         raw_dict = state_dict
 
-        # ==========================================
-        # 【新增代码】清洗权重字典，剥离 torch.compile 的包装前缀
-        # ==========================================
+    # 清洗权重字典，剥离 torch.compile 的包装前缀
     clean_dict = {}
     for key, value in raw_dict.items():
-        # 如果前缀包含 _orig_mod.，直接把它替换为空字符串
         clean_key = key.replace('_orig_mod.', '')
         clean_dict[clean_key] = value
-    # ==========================================
 
-    # 使用清洗后的干净字典加载权重
     model.load_state_dict(clean_dict)
-
     model.eval()  # 切换到评估模式
     return model
 
@@ -43,95 +36,123 @@ def load_trained_model(checkpoint_path):
 def produce_ensemble(model, prior, total_n=100000, batch_size=1024):
     """
     批量生成物理构型集成
-    1. 并行生成 Proposal (从自由场先验采样 -> 流模型变形)
-    2. 串行构建 Markov Chain (MH 验证)
+    修复了 OOM 显存灾难，并批处理了 Action 计算
     """
+    original_dtype = next(model.parameters()).dtype
+
+    # 保持双精度以满足你的物理验证需求
+    model = model.double()
+    prior = prior.double()
+    eval_dtype = torch.float64
+
     all_phis = []
     all_log_qs = []
 
+    dummy_progress = torch.tensor(1.0, device=device, dtype=eval_dtype)
+    enforce_sym = CONFIG.get('enforce_z2_sym', False)
+
     # --- 第一步：并行采样 (GPU 加速) ---
-    print(f"正在并行生成 {total_n} 个提案...")
+    print(f"[{time.strftime('%H:%M:%S')}] 开始生成 {total_n} 个提案 (FP64 模式)...")
+    start_time = time.time()
+
     with torch.no_grad():
-        for _ in range(0, total_n, batch_size):
-            print(f'第{_//batch_size}轮，总共{total_n//batch_size}轮')
+        for i in range(0, total_n, batch_size):
             current_batch = min(batch_size, total_n - len(all_phis))
 
-            # 1. 从自由场先验中采样
             z, log_p_z = prior.sample(current_batch)
-
-            # 2. 通过流模型进行微调变形，获取雅可比行列式对数
-            phi, log_det_J = model(z)
-
-            # 3. 计算最终的生成概率密度 log q(phi)
+            phi, log_det_J = model(z, progress=dummy_progress, enforce_sym=enforce_sym)
             log_q = log_p_z - log_det_J
 
             all_phis.append(phi)
             all_log_qs.append(log_q)
 
+            if (i // batch_size) % 10 == 0:
+                print(
+                    f"   [采样中] 已生成: {min(i + batch_size, total_n)} / {total_n} (耗时: {time.time() - start_time:.2f}s)")
+
     phi_proposals = torch.cat(all_phis, dim=0)
     log_q_proposals = torch.cat(all_log_qs, dim=0)
+    print(f"[{time.strftime('%H:%M:%S')}] 提案生成完毕！准备计算 Action...")
 
-    # 提前计算所有提案的 Action S(phi)
-    s_proposals = compute_action(phi_proposals)
+    # --- 第二步：批处理计算 Action (彻底解决 VRAM 溢出卡死) ---
+    print(f"[{time.strftime('%H:%M:%S')}] 正在分批计算 Action (防止显存爆炸)...")
+    s_proposals_list = []
+    action_start = time.time()
 
-    # --- 第二步：串行 MH 验证 (构建马尔可夫链) ---
-    print("正在通过 MH 算法构建马尔可夫链...")
+    with torch.no_grad():
+        # 这里复用 batch_size，或者为了显存安全可以适当调小
+        action_batch_size = max(256, batch_size // 2)
+        for i in range(0, total_n, action_batch_size):
+            batch_phi = phi_proposals[i:i + action_batch_size]
+            s_batch = compute_action(batch_phi)
+            s_proposals_list.append(s_batch)
 
-    # 初始化链的第一个状态
-    curr_phi = phi_proposals[0:1]
-    curr_log_q = log_q_proposals[0:1]
-    curr_s = s_proposals[0:1]
+            if (i // action_batch_size) % 50 == 0 and i > 0:
+                print(f"   [Action 计算] 已处理: {i} / {total_n}")
 
-    # 预分配 Tensor 存储物理构型，避免列表 append 导致内存碎片化
-    ensemble = torch.empty((total_n, 1, CONFIG['L'], CONFIG['L']), dtype=phi_proposals.dtype)
+    s_proposals = torch.cat(s_proposals_list, dim=0)
+    print(f"[{time.strftime('%H:%M:%S')}] Action 计算完毕！(耗时: {time.time() - action_start:.2f}s)")
 
-    # 预分配布尔型 Tensor，记录每一步是否发生了跳转
-    accept_history = torch.empty(total_n, dtype=torch.bool)
+    # --- 第三步：串行 MH 验证 (CPU NumPy 极速处理) ---
+    print(f"[{time.strftime('%H:%M:%S')}] 开始 CPU NumPy 马尔可夫链筛选...")
+    mh_start = time.time()
 
-    # 第 0 步是链的起点
-    ensemble[0] = curr_phi.cpu()
-    accept_history[0] = True
+    s_np = s_proposals.cpu().numpy()
+    log_q_np = log_q_proposals.cpu().numpy()
+    log_rands_np = np.log(np.random.rand(total_n))
+
+    accepted_indices = np.zeros(total_n, dtype=int)
+    accept_history = np.zeros(total_n, dtype=bool)
+
     accepted_count = 1
+    accepted_indices[0] = 0
+    accept_history[0] = True
+
+    curr_s_val = s_np[0]
+    curr_log_q_val = log_q_np[0]
 
     for i in range(1, total_n):
-        prop_phi = phi_proposals[i:i + 1]
-        prop_log_q = log_q_proposals[i:i + 1]
-        prop_s = s_proposals[i:i + 1]
+        prop_s_val = s_np[i]
+        prop_log_q_val = log_q_np[i]
 
-        # 计算 Metropolis-Hastings 接受率对数
-        # log_acc = (-S_new - log_q_new) - (-S_old - log_q_old)
-        log_acc_ratio = (-prop_s - prop_log_q) - (-curr_s - curr_log_q)
+        log_acc_ratio = (-prop_s_val - prop_log_q_val) - (-curr_s_val - curr_log_q_val)
 
-        # 显式提取本次的接受判定结果
-        is_accepted = torch.log(torch.rand(1, device=device)) < log_acc_ratio
-
-        if is_accepted:
-            curr_phi, curr_log_q, curr_s = prop_phi, prop_log_q, prop_s
+        if log_rands_np[i] < log_acc_ratio:
+            curr_s_val = prop_s_val
+            curr_log_q_val = prop_log_q_val
+            accepted_indices[i] = i
+            accept_history[i] = True
             accepted_count += 1
+        else:
+            accepted_indices[i] = accepted_indices[i - 1]
+            accept_history[i] = False
 
-        if i % 100 == 0:
-            print(f'step:{i},accept ratio:{accepted_count/i:.2%}')
+    print(f"[{time.strftime('%H:%M:%S')}] MH 筛选完毕！纯 CPU 计算耗时: {time.time() - mh_start:.4f}s")
 
-        # 同步写入预分配的内存中
-        ensemble[i] = curr_phi.cpu()
-        accept_history[i] = is_accepted.cpu().squeeze()
+    # 一次性切片拉取最终链，并转换回 float32 节省硬盘空间
+    idx_tensor = torch.tensor(accepted_indices, device=device, dtype=torch.long)
+    ensemble = phi_proposals[idx_tensor].float().cpu().numpy()
 
-    print(f"集成生成完毕！最终接受率: {accepted_count / total_n:.2%}")
-    return ensemble.numpy(), accept_history.numpy()
+    print(f"🎉 集成生成彻底完成！最终接受率: {accepted_count / total_n:.2%}，总耗时: {time.time() - start_time:.2f}s")
+
+    if original_dtype == torch.float32:
+        model = model.float()
+
+    return ensemble, accept_history
 
 
 if __name__ == "__main__":
     PATH = CONFIG['save_path']
-    # PATH = 'best_prior_cnn_res_model_double_precision_True_14_coupling_layers_32_hidden_layers_6_hidden_channels_16_iterations_45000.pt'
+    # 如果想手动指定模型，可以在这里解除注释：
+    # PATH = 'latest_shared_trunk_prior_cnn_dp_False_L14_c6_d2_TrCh64x6_Ly3x6_trk_3_3_dil_1_2_Sh96x6L1x6_Th48x6L1x6_iter_60000.pt'
+
     print(f"模型加载路径: {PATH}")
 
     if CONFIG.get('double_precision', False):
         torch.set_default_dtype(torch.float64)
         print('double precision: True')
 
-    trained_model = load_trained_model(
-        PATH
-    )
+    trained_model = load_trained_model(PATH)
 
     # --- 实例化并配置 FreeFieldPrior ---
     # 破缺相下使用质量的绝对值作为先验的正质量参数
@@ -141,8 +162,8 @@ if __name__ == "__main__":
     if CONFIG.get('double_precision', False):
         prior = prior.double()
 
-    # 生成物理集成 (例如 100,000 个构型)
-    final_configs, accept_traj = produce_ensemble(trained_model, prior, total_n=100000)
+    # 生成物理集成 (100,000 个构型)
+    final_configs, accept_traj = produce_ensemble(trained_model, prior, total_n=200000)
 
     # 打包保存
     save_file = CONFIG['phi_ensemble_save_path']
@@ -151,4 +172,4 @@ if __name__ == "__main__":
         configs=final_configs,
         accept_history=accept_traj
     )
-    print(f"数据已打包保存至 {save_file}")
+    print(f"数据已极速打包并压缩保存至 {save_file}")

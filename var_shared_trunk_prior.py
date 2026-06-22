@@ -7,6 +7,9 @@ import numpy as np
 import os
 import glob
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 print(torch.cuda.is_available())
 if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0))
@@ -84,6 +87,7 @@ def auto_find_latest_checkpoint(config):
 # 1. 物理参数配置
 # ==========================================
 CONFIG = {
+    # 'type': 'shared_trunk_prior_cnn8_m_free',
     'type': 'shared_trunk_prior_cnn',
     'L': 14,
     'm_sq': -4.0,
@@ -92,9 +96,9 @@ CONFIG = {
     'lr': 1e-3,
     'use_scheduler': True,
     'scheduler_min': 1e-5,
-    'iterations': 60000,
+    'iterations': 100000,
     'scheduler_steps': 35000,
-    'warmup_steps': 3000.0,
+    'warmup_steps': 12000.0,
     'target_acc_ratio': 0.78,
 
     'enforce_z2_sym': False,
@@ -107,22 +111,25 @@ CONFIG = {
     # 🌟 核心修改：支持列表，按 U-Net "沙漏" 风格设计，中间层更深更宽
     # 如果用单个整数（如 96），则兼容旧版，所有层全部为 96
     # 'trunk_channels': [128, 128, 128, 128, 128, 128],
-    'trunk_channels': [24, 24, 24, 24, 24, 24],
-    'trunk_layers':   [3, 3, 3, 3, 3, 3],
+    'trunk_channels': [64, 64, 64, 64, 64, 64], # 64通道参数
+    # 'trunk_channels': [8, 8, 8, 8, 8, 8],
+    'trunk_layers': [3, 3, 3, 3, 3, 3],
     'trunk_use_multi_kernel': True,
-    'trunk_kernel_sizes': (3, ),
-    'trunk_dilations': (1, ),
+    'trunk_kernel_sizes': (3, 3),# 64通道参数
+    'trunk_dilations': (1, 2),# 64通道参数
+    # 'trunk_kernel_sizes': (3, ),
+    # 'trunk_dilations': (1, ),
 
     # 🌟 S 分支也支持逐层调控，首尾较浅，中间较深
-    # 's_head_channels': [96, 96, 96, 96, 96, 96],
-    's_head_channels': [24, 24, 24, 24, 24, 24],
-    's_head_layers':   [0, 0, 0, 0, 0, 0],
+    's_head_channels': [96, 96, 96, 96, 96, 96],
+    # 's_head_channels': [8, 8, 8, 8, 8, 8],
+    's_head_layers': [1, 1, 1, 1, 1, 1],
     's_head_kernel_size': 3,
 
     # 🌟 T 分支同理
-    # 't_head_channels': [64, 64, 64, 64, 64, 64],
-    't_head_channels': [24, 24, 24, 24, 24, 24],
-    't_head_layers':   [0, 0, 0, 0, 0, 0],
+    't_head_channels': [64, 64, 64, 64, 64, 64],
+    # 't_head_channels': [8, 8, 8, 8, 8, 8],
+    't_head_layers': [1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
 }
 
@@ -170,7 +177,11 @@ laplacian_kernel = torch.tensor([[
 # ==========================================
 def compute_action(phi):
     phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
-    laplacian = F.conv2d(phi_padded, laplacian_kernel)
+    # 🌟 关键修改：动态克隆一个与输入张量完全一致的卷积核
+    # 这样无论是训练(FP32)还是验证(FP64)，都不会报错
+    adaptive_kernel = laplacian_kernel.to(dtype=phi.dtype, device=phi.device)
+
+    laplacian = F.conv2d(phi_padded, adaptive_kernel)
     action_density = phi * laplacian + CONFIG['m_sq'] * (phi ** 2) + CONFIG['lam'] * (phi ** 4)
     return torch.sum(action_density, dim=(1, 2, 3))
 
@@ -214,6 +225,10 @@ class ResBlock(nn.Module):
             layers.append(nn.LeakyReLU(0.01))
 
         self.block = nn.Sequential(*layers)
+        # 👇 🌟 必须加上这两行！驯服大步长的核心！
+        nn.init.zeros_(self.block[-2].weight)
+        if self.block[-2].bias is not None:
+            nn.init.zeros_(self.block[-2].bias)
 
     def forward(self, x):
         # 🌟 现在的残差连接极其简洁
@@ -238,6 +253,7 @@ class MultiScaleResBlock(nn.Module):
             self.branches.append(layers)
 
         self.fusion_conv = nn.Conv2d(channels * len(kernel_sizes), channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self.fusion_conv.weight)
 
     def forward(self, x):
         outs = []
@@ -259,7 +275,7 @@ class ConvContextNet(nn.Module):
     def __init__(self,
                  trunk_channels=64, trunk_layers=3,
                  trunk_use_multi_kernel=True, trunk_kernel_sizes=(3, 3), trunk_dilations=(1, 2),
-                 s_head_channels=32, s_head_layers=1, s_head_kernel_size=3, # 👈 接收 s_kernel
+                 s_head_channels=32, s_head_layers=1, s_head_kernel_size=3,  # 👈 接收 s_kernel
                  t_head_channels=32, t_head_layers=1, t_kernel_size=3,
                  branch_depth=2):
         super().__init__()
@@ -268,21 +284,27 @@ class ConvContextNet(nn.Module):
         self.t_head_layers = t_head_layers
 
         # --- 🌟 1. 构造共享主干网络 (Shared Trunk) ---
-        trunk_list = [nn.Conv2d(1, trunk_channels, kernel_size=3, padding=1, padding_mode='circular'), nn.LeakyReLU(0.01)]
+        trunk_list = [nn.Conv2d(1, trunk_channels, kernel_size=3, padding=1, padding_mode='circular'),
+                      nn.LeakyReLU(0.01)]
         for _ in range(trunk_layers):
             if trunk_use_multi_kernel:
-                trunk_list.append(MultiScaleResBlock(trunk_channels, kernel_sizes=trunk_kernel_sizes, dilations=trunk_dilations, branch_depth=branch_depth))
+                trunk_list.append(
+                    MultiScaleResBlock(trunk_channels, kernel_sizes=trunk_kernel_sizes, dilations=trunk_dilations,
+                                       branch_depth=branch_depth))
             else:
-                trunk_list.append(ResBlock(trunk_channels, kernel_size=trunk_kernel_sizes[0], branch_depth=branch_depth))
+                trunk_list.append(
+                    ResBlock(trunk_channels, kernel_size=trunk_kernel_sizes[0], branch_depth=branch_depth))
         self.trunk_net = nn.Sequential(*trunk_list)
 
         # --- 🌟 2. 构造 S 的独立分支 (支持 0 层直通) ---
         s_pad = s_head_kernel_size // 2
         if s_head_layers == 0:
             # 如果为0，直接用一层卷积把 trunk 特征映射为1通道输出 (s)
-            self.s_head = nn.Conv2d(trunk_channels, 1, kernel_size=s_head_kernel_size, padding=s_pad, padding_mode='circular')
+            self.s_head = nn.Conv2d(trunk_channels, 1, kernel_size=s_head_kernel_size, padding=s_pad,
+                                    padding_mode='circular')
         else:
-            s_head_list = [nn.Conv2d(trunk_channels, s_head_channels, kernel_size=s_head_kernel_size, padding=s_pad, padding_mode='circular'), nn.LeakyReLU(0.01)]
+            s_head_list = [nn.Conv2d(trunk_channels, s_head_channels, kernel_size=s_head_kernel_size, padding=s_pad,
+                                     padding_mode='circular'), nn.LeakyReLU(0.01)]
             for _ in range(s_head_layers):
                 s_head_list.append(ResBlock(s_head_channels, kernel_size=s_head_kernel_size, branch_depth=branch_depth))
             s_head_list.append(nn.Conv2d(s_head_channels, 1, kernel_size=1))
@@ -292,9 +314,11 @@ class ConvContextNet(nn.Module):
         t_pad = t_kernel_size // 2
         if t_head_layers == 0:
             # 如果为0，直接用一层卷积把 trunk 特征映射为1通道输出 (t)
-            self.t_head = nn.Conv2d(trunk_channels, 1, kernel_size=t_kernel_size, padding=t_pad, padding_mode='circular')
+            self.t_head = nn.Conv2d(trunk_channels, 1, kernel_size=t_kernel_size, padding=t_pad,
+                                    padding_mode='circular')
         else:
-            t_head_list = [nn.Conv2d(trunk_channels, t_head_channels, kernel_size=t_kernel_size, padding=t_pad, padding_mode='circular'), nn.LeakyReLU(0.01)]
+            t_head_list = [nn.Conv2d(trunk_channels, t_head_channels, kernel_size=t_kernel_size, padding=t_pad,
+                                     padding_mode='circular'), nn.LeakyReLU(0.01)]
             for _ in range(t_head_layers):
                 t_head_list.append(ResBlock(t_head_channels, kernel_size=t_kernel_size, branch_depth=branch_depth))
             t_head_list.append(nn.Conv2d(t_head_channels, 1, kernel_size=1))
@@ -368,8 +392,8 @@ class FlowModel(nn.Module):
         dtype = torch.float64 if config.get('double_precision', False) else torch.float32
 
         # 防爆盾边界
-        self.register_buffer('s_bounds', torch.tensor([-0.5, 4.0], dtype=dtype))
-        self.register_buffer('t_bounds', torch.tensor([-15.0, 15.0], dtype=dtype))
+        self.register_buffer('s_bounds', torch.tensor([-0.2, 3.0], dtype=dtype))
+        self.register_buffer('t_bounds', torch.tensor([-3.0, 3.0], dtype=dtype))
 
         # 🌟 新增：提取单层配置的辅助函数
         def get_layer_cfg(key, default, layer_idx):
@@ -416,17 +440,24 @@ class FlowModel(nn.Module):
         print("=" * 70)
 
     def step_warmup(self, progress):
+        """永远不撤除防爆盾，最高放宽到物理安全极限"""
+        clamped_progress = min(progress, 1.0)
+        self.s_bounds[0].fill_(-0.2 - 0.3 * clamped_progress)
+        self.s_bounds[1].fill_(3.0 + 2.0 * clamped_progress)
+        self.t_bounds[0].fill_(-3.0 - 5.0 * clamped_progress)
+        self.t_bounds[1].fill_(3.0 + 5.0 * clamped_progress)
+
         """只负责放宽边界，防爆盾的开关由外部的 .train() 和 .eval() 决定"""
-        if progress < 1.0:
-            self.s_bounds[0].fill_(-0.5 - 1.5 * progress)
-            self.s_bounds[1].fill_(4.0 + 4.0 * progress)
-            self.t_bounds[0].fill_(-15.0 - 15.0 * progress)
-            self.t_bounds[1].fill_(15.0 + 15.0 * progress)
-        else:
-            self.s_bounds[0].fill_(-100.0)
-            self.s_bounds[1].fill_(100.0)
-            self.t_bounds[0].fill_(-100.0)
-            self.t_bounds[1].fill_(100.0)
+        # if progress < 1.0:
+        #     self.s_bounds[0].fill_(-0.2 - 0.3 * progress)
+        #     self.s_bounds[1].fill_(3.0 + 2.0 * progress)
+        #     self.t_bounds[0].fill_(-3.0 - 5.0 * progress)
+        #     self.t_bounds[1].fill_(3.0 + 5.0 * progress)
+        # else:
+        #     self.s_bounds[0].fill_(-100.0)
+        #     self.s_bounds[1].fill_(100.0)
+        #     self.t_bounds[0].fill_(-100.0)
+        #     self.t_bounds[1].fill_(100.0)
 
     def forward(self, z, progress=None, enforce_sym=False):
         phi = z
@@ -455,14 +486,11 @@ class FlowModel(nn.Module):
                     st_out = net(phi_frozen)
                     s_out, t_out = st_out[:, 0:1, :, :], st_out[:, 1:2, :, :]
 
-                if self.training and progress is not None:
-                    is_warmup = (progress < 1.0).view(1, 1, 1, 1)
-
-                    s_clamped = asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
-                    t_clamped = torch.clamp(t_out, self.t_bounds[0], self.t_bounds[1])
-
-                    s_out = torch.where(is_warmup, s_clamped, s_out)
-                    t_out = torch.where(is_warmup, t_clamped, t_out)
+                # 🌟 无条件、永久生效的绝对防御！
+                s_clamped = asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
+                t_clamped = self.t_bounds[1] * torch.tanh(t_out / self.t_bounds[1])
+                s_out = s_clamped
+                t_out = t_clamped
 
                 update_mask = 1.0 - current_mask
 
@@ -521,32 +549,40 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
             all_s[i:i + current_batch] = compute_action(phi)
             all_log_qs[i:i + current_batch] = log_p_z - log_det_J
 
+    # ================= ⬇️ 将这段粘贴到原来删除的位置 ⬇️ =================
+    # 🌟 修改：MCMC 提速黑魔法 - NumPy 批量切片法
+    # 1. 把所有一维的标量数据拉回 CPU 内存 (10万个 float 瞬间完成)
+    s_np = all_s.cpu().numpy()
+    log_q_np = all_log_qs.cpu().numpy()
+
+    # 注意这里直接在 CPU 上生成随机数，省去了 GPU 通信
+    log_rands_np = np.log(np.random.rand(total_n))
+
+    accepted_indices = np.zeros(total_n, dtype=int)
     accepted_count = 0
-    curr_phi = all_phis[0]
-    curr_s = all_s[0]
-    curr_log_q = all_log_qs[0]
 
-    log_rands = torch.log(torch.rand(total_n, device=device, dtype=dtype))
+    curr_s_val = s_np[0]
+    curr_log_q_val = log_q_np[0]
+    accepted_indices[0] = 0
 
-    # 🌟 新增：记录马尔可夫链中的每一个真实状态，用于后续计算观测值
-    chain_phis = torch.empty_like(all_phis)
-    chain_phis[0] = curr_phi
-
+    # 2. 在纯 CPU 内存里跑循环，只算标量加减，极其快速
     for i in range(1, total_n):
-        prop_phi = all_phis[i]
-        prop_s = all_s[i]
-        prop_log_q = all_log_qs[i]
+        prop_s_val = s_np[i]
+        prop_log_q_val = log_q_np[i]
 
-        log_acc_ratio = (-prop_s - prop_log_q) - (-curr_s - curr_log_q)
+        log_acc_ratio = (-prop_s_val - prop_log_q_val) - (-curr_s_val - curr_log_q_val)
 
-        if log_rands[i] < log_acc_ratio:
-            curr_phi = prop_phi
-            curr_s = prop_s
-            curr_log_q = prop_log_q
+        if log_rands_np[i] < log_acc_ratio:
+            curr_s_val = prop_s_val
+            curr_log_q_val = prop_log_q_val
+            accepted_indices[i] = i
             accepted_count += 1
+        else:
+            accepted_indices[i] = accepted_indices[i - 1]  # 拒绝则保留上一步的索引
 
-        # 记录当前 MCMC 步的构型
-        chain_phis[i] = curr_phi
+    # 3. 回到 GPU，一次性切片提取完整的构型链 (消灭了所有对构型的 for 循环)
+    idx_tensor = torch.tensor(accepted_indices, device=device, dtype=torch.long)
+    chain_phis = all_phis[idx_tensor]
 
     # 🌟 新增：计算 phi^1 到 phi^5 的在线期望和朴素误差
     phi_powers_mean = []
@@ -573,7 +609,8 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=0.6005269985).to(device)
+    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()
@@ -598,6 +635,9 @@ def train():
         clean_dict = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()}
         model.load_state_dict(clean_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 👇 🌟 新增：强制覆盖旧存档的学习率，杜绝幽灵 LR 归来
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = CONFIG['lr']
         if CONFIG.get('double_precision', False):
             for group in optimizer.param_groups:
                 group['eps'] = 1e-15
@@ -609,7 +649,7 @@ def train():
         start_iteration = checkpoint['iteration'] + 1
         # 👇 🌟 新增这段“无缝补偿”逻辑：
         # 如果当前已经跑过了退火阶段，直接把学习率锁定为你最新的底线
-        if start_iteration > CONFIG['scheduler_steps']:
+        if start_iteration > CONFIG['scheduler_steps'] and CONFIG.get('use_scheduler', True):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = CONFIG['scheduler_min']
             print(
@@ -648,11 +688,14 @@ def train():
             eta_min=CONFIG['scheduler_min'],
             last_epoch=start_iteration - 1 if start_iteration > 1 else -1
         )
+        # 👇 🌟 新增这两行：把调度器保存在 .pt 里的进度读取出来！
+        if old_checkpoint_path and os.path.exists(old_checkpoint_path) and checkpoint.get('scheduler_state_dict'):
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     if hasattr(torch, 'compile') and device.type == 'cuda':
         model.train()
-        # compiled_model = torch.compile(model)
-        compiled_model = model
+        compiled_model = torch.compile(model)
+        # compiled_model = model
     else:
         compiled_model = model
 
@@ -681,7 +724,7 @@ def train():
         batch_mag = torch.mean(phi)
         loss_sym = V * (batch_mag ** 2)
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             print("⚠️ 捕获到 NaN 梯度！跳过本次更新。")
             optimizer.zero_grad()
@@ -747,8 +790,8 @@ def train():
                         'achieved_milestones': achieved_milestones},
                        iter_checkpoint_path)
 
-        if iteration >= 10000 and iteration % 5000 == 0:
-        # if iteration % 100 == 0:
+        if iteration >= 10000 and iteration % 2000 == 0:
+            # if iteration % 100 == 0:
             total_n = 50000
             if iteration % 5000 == 0:
                 total_n = 100000
