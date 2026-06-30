@@ -88,10 +88,11 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'final_normalizing_32_abs',
+    'type': 'sample_mean',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
+    'prior_mean': 1.0, # 🌟 新增：在这里自由设定你想要的初始均值（例如 1.0, -1.0 等）
     'batch_size': 1024,
     'lr': 1e-3,
     'use_scheduler': True,
@@ -132,6 +133,7 @@ CONFIG = {
     't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
 }
+CONFIG['type'] = CONFIG['type'] + '_' + str(CONFIG['prior_mean'])
 
 # ==========================================
 # 动态生成文件名核心
@@ -358,10 +360,11 @@ class ConvContextNet(nn.Module):
 # 4. 自由场先验
 # ==========================================
 class FreeFieldPrior(nn.Module):
-    def __init__(self, L, m_sq_prior):
+    def __init__(self, L, m_sq_prior, mean=0.0):  # 🌟 修改：新增 mean 参数
         super().__init__()
         self.L = L
         self.V = L * L
+        self.mean = mean  # 🌟 记录均值
         p = torch.arange(L) * 2.0 * math.pi / L
         P1, P2 = torch.meshgrid(p, p, indexing='ij')
         K = m_sq_prior + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
@@ -374,7 +377,13 @@ class FreeFieldPrior(nn.Module):
         eta_k = torch.fft.fftn(eta, dim=(-2, -1), norm="ortho")
         phi_k = eta_k / self.sqrt_2K
         phi_free = torch.fft.ifftn(phi_k, dim=(-2, -1), norm="ortho").real
+
+        # 🌟 核心修改：为生成的自由场加上目标均值
+        phi_free = phi_free + self.mean
+
         log_p_eta = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) - self.const_factor
+
+        # 雅可比行列式不受常数平移影响，因此 log_det 保持不变，直接返回
         return phi_free, log_p_eta + self.log_det_factor
 
 
@@ -609,8 +618,10 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=0.6005269985).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+    # 🌟 修改：从 CONFIG 中读取 prior_mean 并传入（如果没设置默认回退为 0.0）
+    prior_mean = CONFIG.get('prior_mean', 0.0)
+    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=0.6005269985, mean=prior_mean).to(device)
+    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()
@@ -624,7 +635,6 @@ def train():
     history_phi1 = []
     history_phi3 = []
     history_phi5 = []
-
     best_loss = float('inf')
     ema_loss = None
     start_iteration = 1
@@ -882,12 +892,13 @@ def train():
                     torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                                'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss,
-                                'ema_loss': ema_loss,
+                                'loss': loss_val, 'best_loss': best_loss,
+                                'history_loss': history_loss,
                                 # 🌟 新增写入
                                 'history_phi1': history_phi1,
                                 'history_phi3': history_phi3,
                                 'history_phi5': history_phi5,
+                                'ema_loss': ema_loss,
                                 'achieved_milestones': achieved_milestones},
                                milestone_path)
                     break

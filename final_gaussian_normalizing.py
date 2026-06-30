@@ -88,7 +88,7 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'final_normalizing_32_abs',
+    'type': 'gaussian_normalizing_64_18',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -104,16 +104,16 @@ CONFIG = {
     'enforce_z2_sym': False,
     'sym_start_iter': 30000,
 
-    'cnn_coupling_layers': 12,
+    'cnn_coupling_layers': 18,
     'branch_depth': 2,
     'double_precision': False,
 
     # 🌟 核心修改：支持列表，按 U-Net "沙漏" 风格设计，中间层更深更宽
     # 如果用单个整数（如 96），则兼容旧版，所有层全部为 96
     # 'trunk_channels': [128, 128, 128, 128, 128, 128],
-    'trunk_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32], # 64通道参数
+    'trunk_channels': [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64], # 64通道参数
     # 'trunk_channels': [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
-    'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
     'trunk_use_multi_kernel': True,
     'trunk_kernel_sizes': (3, ),# 64通道参数
     'trunk_dilations': (1, ),# 64通道参数
@@ -121,15 +121,15 @@ CONFIG = {
     # 'trunk_dilations': (1, ),
 
     # 🌟 S 分支也支持逐层调控，首尾较浅，中间较深
-    's_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
+    's_head_channels': [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     # 's_head_channels': [8, 8, 8, 8, 8, 8],
-    's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     's_head_kernel_size': 3,
 
     # 🌟 T 分支同理
-    't_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
+    't_head_channels': [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     # 't_head_channels': [8, 8, 8, 8, 8, 8],
-    't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
 }
 
@@ -358,24 +358,31 @@ class ConvContextNet(nn.Module):
 # 4. 自由场先验
 # ==========================================
 class FreeFieldPrior(nn.Module):
-    def __init__(self, L, m_sq_prior):
+    def __init__(self, L, mean=0.0, std=1.0):
         super().__init__()
         self.L = L
         self.V = L * L
-        p = torch.arange(L) * 2.0 * math.pi / L
-        P1, P2 = torch.meshgrid(p, p, indexing='ij')
-        K = m_sq_prior + 4.0 * torch.sin(P1 / 2.0) ** 2 + 4.0 * torch.sin(P2 / 2.0) ** 2
-        self.register_buffer('sqrt_2K', torch.sqrt(2.0 * K).view(1, 1, L, L))
-        self.register_buffer('log_det_factor', 0.5 * torch.sum(torch.log(2.0 * K)))
-        self.register_buffer('const_factor', torch.tensor(0.5 * self.V * math.log(2.0 * math.pi)))
+        self.mean = mean
+        self.std = std
+
+        # 提前计算好常数项：- (V / 2) * log(2 * pi * std^2)
+        const_val = -0.5 * self.V * math.log(2.0 * math.pi * (std ** 2))
+        self.register_buffer('const_factor', torch.tensor(const_val))
 
     def sample(self, batch_size):
-        eta = torch.randn(batch_size, 1, self.L, self.L, device=self.sqrt_2K.device, dtype=self.sqrt_2K.dtype)
-        eta_k = torch.fft.fftn(eta, dim=(-2, -1), norm="ortho")
-        phi_k = eta_k / self.sqrt_2K
-        phi_free = torch.fft.ifftn(phi_k, dim=(-2, -1), norm="ortho").real
-        log_p_eta = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) - self.const_factor
-        return phi_free, log_p_eta + self.log_det_factor
+        # 1. 直接在实空间生成标准正态分布的噪声 eta ~ N(0, 1)
+        eta = torch.randn(batch_size, 1, self.L, self.L,
+                          device=self.const_factor.device,
+                          dtype=self.const_factor.dtype)
+
+        # 2. 施加均值和平移 (重参数化技巧)
+        phi_gaussian = eta * self.std + self.mean
+
+        # 3. 计算对数概率密度
+        # log_p = -0.5 * sum(eta^2) + const_factor
+        log_p_eta = -0.5 * torch.sum(eta ** 2, dim=(1, 2, 3)) + self.const_factor
+
+        return phi_gaussian, log_p_eta
 
 
 # ==========================================
@@ -609,8 +616,8 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=0.6005269985).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+    prior = FreeFieldPrior(L=CONFIG['L']).to(device)
+    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()
@@ -802,13 +809,12 @@ def train():
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'loss': loss_val, 'best_loss': best_loss,
-                        'history_loss': history_loss,
+                        'loss': loss_val,
                         # 🌟 新增写入
                         'history_phi1': history_phi1,
                         'history_phi3': history_phi3,
                         'history_phi5': history_phi5,
-                        'ema_loss': ema_loss,
+                        'best_loss': best_loss, 'history_loss': history_loss, 'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        save_path)
 
@@ -882,12 +888,13 @@ def train():
                     torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                                'loss': loss_val, 'best_loss': best_loss, 'history_loss': history_loss,
-                                'ema_loss': ema_loss,
+                                'loss': loss_val,
                                 # 🌟 新增写入
                                 'history_phi1': history_phi1,
                                 'history_phi3': history_phi3,
                                 'history_phi5': history_phi5,
+                                'best_loss': best_loss, 'history_loss': history_loss,
+                                'ema_loss': ema_loss,
                                 'achieved_milestones': achieved_milestones},
                                milestone_path)
                     break

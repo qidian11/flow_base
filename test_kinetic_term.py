@@ -31,33 +31,11 @@ def is_valid_checkpoint(filepath):
         return False
 
 
-def fmt_cfg(val):
-    if not isinstance(val, (list, tuple)): return str(val)
-    compressed = []
-    count = 1
-    for i in range(1, len(val)):
-        if val[i] == val[i - 1]:
-            count += 1
-        else:
-            compressed.append(f"{val[i - 1]}x{count}" if count > 1 else str(val[i - 1]))
-            count = 1
-    compressed.append(f"{val[-1]}x{count}" if count > 1 else str(val[-1]))
-    return "-".join(compressed)
-
-
 def get_base_name(config):
-    """🌟 按照要求：以 gaussian_block_{block_num} 为基础命名"""
-    tk_str = '_'.join(map(str, config.get('trunk_kernel_sizes', (3, 3))))
-    tdil_str = '_'.join(map(str, config.get('trunk_dilations', (1, 2))))
-    trunk_rf = f"trk_{tk_str}_dil_{tdil_str}"
-
+    """直接以实验名称和核心参数作为文件标识，确保完全隔离"""
     base_name = (
-        f"gaussian_block_{config['block_num']}_dp_{config.get('double_precision', False)}_"
-        f"L{config['L']}_c{config['cnn_coupling_layers']}_d{config.get('branch_depth', 2)}_"
-        f"TrCh{fmt_cfg(config.get('trunk_channels'))}_Ly{fmt_cfg(config.get('trunk_layers'))}_{trunk_rf}_"
-        f"Sh{fmt_cfg(config.get('s_head_channels'))}L{fmt_cfg(config.get('s_head_layers'))}_"
-        f"Th{fmt_cfg(config.get('t_head_channels'))}L{fmt_cfg(config.get('t_head_layers'))}_"
-        f"iter_{config['iterations']}"
+        f"{config['exp_name']}_dp_{config.get('double_precision', False)}_"
+        f"L{config['L']}_c{config['cnn_coupling_layers']}_iter_{config['iterations']}"
     )
     return base_name
 
@@ -80,7 +58,7 @@ def auto_find_latest_checkpoint(config):
 
 
 # ==========================================
-# 2. 标量场理论的 Action 计算
+# 2. 标量场理论的 Action 计算 (支持实验切换)
 # ==========================================
 laplacian_kernel = torch.tensor([[
     [0.0, -1.0, 0.0],
@@ -90,23 +68,35 @@ laplacian_kernel = torch.tensor([[
 
 
 def compute_action(phi, config):
-    phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
-    adaptive_kernel = laplacian_kernel.to(dtype=phi.dtype, device=phi.device)
-    laplacian = F.conv2d(phi_padded, adaptive_kernel)
-    action_density = phi * laplacian + config['m_sq'] * (phi ** 2) + config['lam'] * (phi ** 4)
+    """根据实验配置动态切换物理项"""
+    action_density = torch.zeros_like(phi)
+
+    # 动能项 (空间关联)
+    if config.get('use_kinetic', True):
+        phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
+        adaptive_kernel = laplacian_kernel.to(dtype=phi.dtype, device=phi.device)
+        laplacian = F.conv2d(phi_padded, adaptive_kernel)
+        action_density += phi * laplacian
+
+    # 质量项 (始终保留以保证积分收敛)
+    action_density += config['m_sq'] * (phi ** 2)
+
+    # 势能相互作用项 (局域非线性)
+    if config.get('use_potential', True):
+        action_density += config['lam'] * (phi ** 4)
+
     return torch.sum(action_density, dim=(1, 2, 3))
 
 
 # ==========================================
-# 3. 动态掩码生成与卷积上下文网络
+# 3. 经典棋盘掩码生成与卷积上下文网络
 # ==========================================
-def create_dynamic_block_mask(L, block_num):
-    if L % block_num != 0: raise ValueError(f"晶格大小 L 必须能被 block_num 整除！")
-    block_size = L // block_num
+def create_checkerboard_mask(L):
+    """生成严格的 1x1 棋盘掩码 (Checkerboard Mask)"""
     indices = torch.arange(L)
-    block_indices = indices // block_size
-    mask_2d = (block_indices[:, None] + block_indices[None, :]) % 2 == 0
-    return mask_2d.view(1, 1, L, L).float()
+    x, y = torch.meshgrid(indices, indices, indexing='ij')
+    mask_2d = ((x + y) % 2 == 0).float()
+    return mask_2d.view(1, 1, L, L)
 
 
 class ResBlock(nn.Module):
@@ -197,7 +187,7 @@ class ConvContextNet(nn.Module):
 
 
 # ==========================================
-# 4. 标准高斯先验 (Standard Gaussian Prior)
+# 4. 标准高斯先验
 # ==========================================
 class StandardGaussianPrior(nn.Module):
     def __init__(self, L):
@@ -225,7 +215,10 @@ class FlowModel(nn.Module):
         super().__init__()
         self.L = config['L']
         self.cnn_layers = config['cnn_coupling_layers']
-        self.register_buffer('base_mask', create_dynamic_block_mask(self.L, config['block_num']))
+
+        # 挂载严格的棋盘掩码
+        self.register_buffer('base_mask', create_checkerboard_mask(self.L))
+
         self.context_nets = nn.ModuleList()
         dtype = torch.float64 if config.get('double_precision', False) else torch.float32
 
@@ -419,11 +412,6 @@ def train(config, resume=True):
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi, config))
         loss.backward()
 
-        with torch.no_grad():
-            history_phi1.append(torch.mean(phi).item())
-            history_phi3.append(torch.mean(phi ** 3).item())
-            history_phi5.append(torch.mean(phi ** 5).item())
-
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             optimizer.zero_grad()
@@ -438,7 +426,7 @@ def train(config, resume=True):
 
         if iteration % 100 == 0:
             print(
-                f"Iter: {iteration:6d} | Z2: {'ON' if enforce_sym else 'OFF'} | EMA Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                f"Iter: {iteration:6d} | EMA Loss: {ema_loss:.4f} | Best: {best_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None, 'loss': loss_val,
@@ -446,13 +434,13 @@ def train(config, resume=True):
                         'history_loss': history_loss, 'ema_loss': ema_loss, 'achieved_milestones': achieved_milestones},
                        checkpoint_path)
 
-        if ema_loss < best_loss and iteration >= 10000:
+        if ema_loss < best_loss and iteration >= 5000:
             best_loss = ema_loss
             torch.save({'model_state_dict': model.state_dict()}, save_path)
 
-        if iteration >= 4000 and iteration % 2000 == 0:
-            total_n = 50000 if iteration % 5000 != 0 else 100000
-            print(f"\n🚀 [Iter {iteration}] MCMC 验证 (N={total_n})...")
+        if iteration >= 2000 and iteration % 2000 == 0:
+            total_n = 20000 if iteration % 4000 != 0 else 50000
+            print(f"\n🚀 [{config['exp_name']} - Iter {iteration}] MCMC 验证 (N={total_n})...")
             acc_rate, phi_means, phi_errs = run_mcmc_evaluation(compiled_model, prior, config, total_n=total_n,
                                                                 enforce_sym=enforce_sym)
 
@@ -464,9 +452,6 @@ def train(config, resume=True):
             np.savez(observables_save_path, steps=np.array(mcmc_steps), acc=np.array(history_acc),
                      phi_means=np.array(history_phi_means), phi_errs=np.array(history_phi_errs))
 
-            if acc_rate >= config['target_acc_ratio']:
-                print(f"🎉 提前达标！({acc_rate:.2%} >= {config['target_acc_ratio']:.0%})")
-                break
     return model
 
 
@@ -474,10 +459,9 @@ def train(config, resume=True):
 # 8. 自动化批处理执行入口
 # ==========================================
 if __name__ == "__main__":
-    CONFIG = {
-        'L': 8,
-        'm_sq': -4.0,
-        'lam': 6.008,
+    # 通用网络配置
+    BASE_CONFIG = {
+        'L': 14,
         'batch_size': 1024,
         'lr': 1e-3,
         'use_scheduler': True,
@@ -485,34 +469,59 @@ if __name__ == "__main__":
         'iterations': 15000,
         'scheduler_steps': 10000,
         'warmup_steps': 5000.0,
-        'target_acc_ratio': 0.78,
-        'enforce_z2_sym': False,
-        'sym_start_iter': 30000,
         'cnn_coupling_layers': 10,
         'branch_depth': 2,
         'double_precision': False,
-        'trunk_channels': [16] * 10,
-        'trunk_layers': [3] * 10,
+        'trunk_channels': [16] * 12,
+        'trunk_layers': [3] * 12,
         'trunk_use_multi_kernel': True,
         'trunk_kernel_sizes': (3,),
         'trunk_dilations': (1,),
-        's_head_channels': [16] * 10,
-        's_head_layers': [1] * 10,
+        's_head_channels': [16] * 12,
+        's_head_layers': [1] * 12,
         's_head_kernel_size': 3,
-        't_head_channels': [16] * 10,
-        't_head_layers': [1] * 10,
+        't_head_channels': [16] * 12,
+        't_head_layers': [1] * 12,
         't_kernel_size': 3,
     }
 
-    if CONFIG.get('double_precision', False):
+    if BASE_CONFIG.get('double_precision', False):
         torch.set_default_dtype(torch.float64)
 
-    block_nums_to_test = [2, 4, 8]
+    # ==================================
+    # 实验 A 配置：纯动能项 (空间关联测试)
+    # ==================================
+    CONFIG_A = BASE_CONFIG.copy()
+    CONFIG_A.update({
+        'exp_name': 'Exp_A_Pure_Kinetic',
+        'use_kinetic': True,
+        'use_potential': False,
+        'm_sq': 0.09,  # 必须正质量防止发散
+        'lam': 0.0,
+    })
 
-    for b_num in block_nums_to_test:
-        print("=" * 60)
-        print(f"🚀 开始执行实验对照组: block_num = {b_num} (晶格 L={CONFIG['L']})")
-        print("=" * 60)
-        current_config = CONFIG.copy()
-        current_config['block_num'] = b_num
-        train(config=current_config, resume=True)
+    # ==================================
+    # 实验 B 配置：纯势能项 (超局域非线性测试)
+    # ==================================
+    CONFIG_B = BASE_CONFIG.copy()
+    CONFIG_B.update({
+        'exp_name': 'Exp_B_Pure_Potential',
+        'use_kinetic': False,
+        'use_potential': True,
+        'm_sq': -4.0,  # 必须正质量防止简并模式坍缩
+        'lam': 5.113,
+    })
+
+    print("=" * 70)
+    print("🔬 开始进行消融对照实验")
+    print("=" * 70)
+
+    print("\n>>> 正在启动 实验A：纯动能项 (测试空间关联学习瓶颈) <<<")
+    train(config=CONFIG_A, resume=True)
+
+    print("\n" + "=" * 70)
+
+    print("\n>>> 正在启动 实验B：纯势能项 (测试局部非线性学习能力) <<<")
+    train(config=CONFIG_B, resume=True)
+
+    print("\n✅ 所有对照实验执行完毕！你可以利用保存的 npz 文件进行接受率曲线绘制了。")

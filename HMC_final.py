@@ -31,7 +31,7 @@ CONFIG = [
     'L': 6,
     'm2':-4,
     'lam':6.975,
-    'tao': 1.62,
+    'tao': 1.65,
     'leap_frog_step': 10,
     'save_steps': 10,
     'thermal_steps': 3000,
@@ -271,7 +271,7 @@ def get_correlation_for_single_configuration(binning_ensemble, time_shift, space
 
 
 def get_correlation_from_single_configuration(binning_ensemble):
-    return binning_ensemble.main(dims=(0, 1))
+    return binning_ensemble.mean(dims=(0, 1))
 
 
 def get_expected_phi(binning_ensemble):
@@ -355,7 +355,7 @@ def main(config):
     acc_list = []
 
     while step < config['n_samples']:
-        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, config['tao'])
+        phi, delta_H, inverse_hamiltonian, delta_phi, delta_p, success, avg_acc = HMC_step(phi, config['tao'], config)
 
         if not success:
             print(f"Sample Step {step}: NaN detected! Retrying...")
@@ -400,7 +400,8 @@ def main(config):
     standard_ensemble = ensemble_tensor.unsqueeze(1).cpu().numpy()
 
     # 同样做稀疏化，每隔 100 步取 1 个
-    saved_ensemble = standard_ensemble[::100]
+    # 不稀疏
+    saved_ensemble = standard_ensemble[:1000000]
 
     # 保存为 .npz，且键名设为 'configs'
     dtype_str = "double" if DTYPE == torch.float64 else "single"

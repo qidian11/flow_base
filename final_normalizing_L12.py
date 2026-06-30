@@ -88,17 +88,18 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'final_normalizing_32_abs',
-    'L': 14,
+    'type': 'L12_final_normalizing',
+    'L': 12,
     'm_sq': -4.0,
-    'lam': 5.113,
+    'm_sq_prior': 0.645392,
+    'lam': 5.276,
     'batch_size': 1024,
     'lr': 1e-3,
     'use_scheduler': True,
     'scheduler_min': 1e-5,
     'iterations': 100000,
-    'scheduler_steps': 30000,
-    'warmup_steps': 12000.0,
+    'scheduler_steps': 20000,
+    'warmup_steps': 10000.0,
     'target_acc_ratio': 0.78,
 
     'enforce_z2_sym': False,
@@ -609,8 +610,9 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=0.6005269985).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+    m_sq_prior = CONFIG['m_sq_prior']
+    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=m_sq_prior).to(device)
+    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()
@@ -833,7 +835,7 @@ def train():
                         'achieved_milestones': achieved_milestones},
                        iter_checkpoint_path)
 
-        if iteration >= 10000 and iteration % 2000 == 0:
+        if iteration >= 4000 and iteration % 2000 == 0:
             # if iteration % 100 == 0:
             total_n = 50000
             if iteration % 5000 == 0:

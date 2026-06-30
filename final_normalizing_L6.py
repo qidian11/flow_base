@@ -88,17 +88,18 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'final_normalizing_32_abs',
-    'L': 14,
+    'type': 'L6_final_normalizing',
+    'L': 6,
     'm_sq': -4.0,
-    'lam': 5.113,
+    'm_sq_prior': 1.118882,
+    'lam': 6.975,
     'batch_size': 1024,
     'lr': 1e-3,
     'use_scheduler': True,
     'scheduler_min': 1e-5,
     'iterations': 100000,
-    'scheduler_steps': 30000,
-    'warmup_steps': 12000.0,
+    'scheduler_steps': 10000,
+    'warmup_steps': 10000.0,
     'target_acc_ratio': 0.78,
 
     'enforce_z2_sym': False,
@@ -111,7 +112,7 @@ CONFIG = {
     # 🌟 核心修改：支持列表，按 U-Net "沙漏" 风格设计，中间层更深更宽
     # 如果用单个整数（如 96），则兼容旧版，所有层全部为 96
     # 'trunk_channels': [128, 128, 128, 128, 128, 128],
-    'trunk_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32], # 64通道参数
+    'trunk_channels': [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16], # 64通道参数
     # 'trunk_channels': [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
     'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
     'trunk_use_multi_kernel': True,
@@ -121,13 +122,13 @@ CONFIG = {
     # 'trunk_dilations': (1, ),
 
     # 🌟 S 分支也支持逐层调控，首尾较浅，中间较深
-    's_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
+    's_head_channels': [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
     # 's_head_channels': [8, 8, 8, 8, 8, 8],
     's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     's_head_kernel_size': 3,
 
     # 🌟 T 分支同理
-    't_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
+    't_head_channels': [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
     # 't_head_channels': [8, 8, 8, 8, 8, 8],
     't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
@@ -609,8 +610,9 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
 # ==========================================
 def train():
     model = FlowModel(CONFIG).to(device)
-    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=0.6005269985).to(device)
-    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
+    m_sq_prior = CONFIG['m_sq_prior']
+    prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=m_sq_prior).to(device)
+    # prior = FreeFieldPrior(L=CONFIG['L'], m_sq_prior=abs(CONFIG['m_sq'])).to(device)
 
     if CONFIG['double_precision']:
         model = model.double()
@@ -815,7 +817,7 @@ def train():
         # ==========================================
         # 🌟 新增：每隔 2000 步保存一次带有当前 iteration 的检查点
         # ==========================================
-        if iteration % 2000 == 0:
+        if iteration % 1000 == 0:
             base_name = CONFIG['base_name']
             # 动态拼接带有 iteration 数字的文件名
             iter_checkpoint_path = f"iter_{iteration}_{base_name}.pt"
@@ -833,7 +835,7 @@ def train():
                         'achieved_milestones': achieved_milestones},
                        iter_checkpoint_path)
 
-        if iteration >= 10000 and iteration % 2000 == 0:
+        if iteration >= 4000 and iteration % 2000 == 0:
             # if iteration % 100 == 0:
             total_n = 50000
             if iteration % 5000 == 0:
