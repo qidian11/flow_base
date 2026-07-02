@@ -103,6 +103,7 @@ CONFIG = {
 
     'enforce_z2_sym': False,
     'sym_start_iter': 30000,
+    'lambda_force': 0.01,  # 🌟 新增：Force Matching 的惩罚权重
 
     'cnn_coupling_layers': 12,
     'branch_depth': 2,
@@ -378,6 +379,13 @@ class FreeFieldPrior(nn.Module):
         return phi_free, log_p_eta + self.log_det_factor
 
 
+    # 🌟 新增：解析计算 z 的先验对数概率，用于构建高阶梯度计算图
+    def log_prob(self, z):
+        z_k = torch.fft.fftn(z, dim=(-2, -1), norm="ortho")
+        eta_k_sq = (z_k.abs() * self.sqrt_2K) ** 2
+        log_p = -0.5 * torch.sum(eta_k_sq, dim=(1, 2, 3)) - self.const_factor + self.log_det_factor
+        return log_p
+
 # ==========================================
 # 5. 流模型 (包含防爆盾和双循环重用)
 # ==========================================
@@ -541,8 +549,15 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
     with torch.no_grad():
         for i in range(0, total_n, batch_size):
             current_batch = min(batch_size, total_n - i)
-            z, log_p_z = prior.sample(current_batch)
-            phi, log_det_J = model(z, dummy_progress, enforce_sym=enforce_sym)
+            z_phys, log_p_z = prior.sample(current_batch)
+
+            # 🌟 统一形式：测试时固定规范为 1
+            g = torch.ones_like(z_phys)
+            z_lift = g * z_phys
+
+            # 此时 enforce_sym 保持为 False，完全依赖模型学到的动力学
+            varphi, log_det_J = model(z_lift, dummy_progress, enforce_sym=False)
+            phi = g * varphi
 
             # 🌟 新增：记录下所有的提案 phi
             all_phis[i:i + current_batch] = phi
@@ -711,28 +726,90 @@ def train():
 
     if hasattr(torch, 'compile') and device.type == 'cuda':
         model.train()
-        compiled_model = torch.compile(model)
-        # compiled_model = model
+        # compiled_model = torch.compile(model)
+        compiled_model = model
     else:
         compiled_model = model
 
     model.train()
     for iteration in range(start_iteration, CONFIG['iterations'] + 1):
         optimizer.zero_grad()
-        z, log_p_z = prior.sample(CONFIG['batch_size'])
+
+        # 1. 采样物理场，并显式开启梯度追踪
+        z_phys_raw, _ = prior.sample(CONFIG['batch_size'])
+        z_phys = z_phys_raw.detach().requires_grad_(True)
+        log_p_z = prior.log_prob(z_phys)
+
+        # ❌ 删掉随机 g_x 的生成！
+        # 既然是标准 CNN，就绝不能喂给它被 g 打碎的白噪声！
 
         warmup_steps = CONFIG['warmup_steps']
         progress_val = min(iteration / warmup_steps, 1.0)
         model.step_warmup(progress_val)
         progress_tensor = torch.tensor(progress_val, device=device, dtype=dtype)
 
-        # 🌟 新增：动态判断当前是否需要开启强制对称性
-        enforce_sym = CONFIG.get('enforce_z2_sym', False) and (iteration >= CONFIG.get('sym_start_iter', 0))
+        # 🌟 关闭所有硬约束，让满血 CNN 放飞自我
+        enforce_sym = False
 
-        # 🌟 修改：将 enforce_sym 传给模型
-        phi, log_det_J = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
-        loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
+        # 2. 🌟 直接把平滑的物理先验喂给模型
+        # 因为没有 g，这里输出的直接就是物理场 phi
+        phi, log_det_J = compiled_model(z_phys, progress_tensor, enforce_sym=enforce_sym)
+
+        # 3. 计算 KL Loss
+        S_phi = compute_action(phi)
+        A = S_phi + log_p_z - log_det_J
+        loss_kl = torch.mean(A)
+
+        # 4. 🌟 Score Matching 核心：拉回至 z 空间的受力残差
+        force_residual_z = torch.autograd.grad(
+            outputs=A.sum(),
+            inputs=z_phys,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+
+        # 广延量对齐：空间维度求和，Batch 维度求平均
+        loss_force = torch.mean(torch.sum(force_residual_z ** 2, dim=(1, 2, 3)))
+
+        # ----------------------------------------------------
+        # 🌟 梯度平衡探测器 (Gradient Balancing Detector)
+        # 注意：探测梯度会稍微增加计算时间，找到合适的 lambda 后可以把这段注释掉
+        # ----------------------------------------------------
+
+        # 1. 探测 KL Loss 对网络权重的梯度大小
+        optimizer.zero_grad()
+        loss_kl.backward(retain_graph=True)
+        kl_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                kl_grad_norm += p.grad.data.norm(2).item() ** 2
+        kl_grad_norm = kl_grad_norm ** 0.5
+
+        # 2. 探测 Force Loss 对网络权重的梯度大小
+        optimizer.zero_grad()
+        loss_force.backward(retain_graph=True)
+        force_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                force_grad_norm += p.grad.data.norm(2).item() ** 2
+        force_grad_norm = force_grad_norm ** 0.5
+
+        optimizer.zero_grad()  # 探测完毕，清空梯度
+
+        # 3. 计算理想的 lambda 指导值 (让两者梯度 1:1 等大)
+        ideal_lambda = kl_grad_norm / (force_grad_norm + 1e-8)
+
+        if iteration % 10 == 0:
+            print(f"[梯度探测] KL 梯度大小: {kl_grad_norm:.4f} | Force 梯度大小: {force_grad_norm:.4f}")
+            print(f"👉 建议的 lambda 基础值应在 {ideal_lambda:.6f} 附近")
+
+        # ----------------------------------------------------
+        # 真正用于更新的联合 Loss
+        # ----------------------------------------------------
+        lambda_force = CONFIG.get('lambda_force', 0.001)  # 你可以在 CONFIG 里试探性地填入上面探测出的理想值
+        loss = loss_kl + lambda_force * loss_force
         loss.backward()
+
 
         # 🌟 新增：在不追踪梯度的线下，计算当前轮次输出 phi 的 1, 2, 5 次幂期望值
         with torch.no_grad():
@@ -777,12 +854,13 @@ def train():
 
             print(
                 f"迭代 {iteration:6d}/{CONFIG['iterations']} "
-                f"| Z_2: {z2_status} "  # 🌟 加在这里，一目了然
-                f"| 瞬时 Loss: {loss_val:.4f} "
-                f"| 平滑 Loss: {ema_loss:.4f} "
+                f"| KL: {loss_kl.item():.4f} "
+                f"| Force: {loss_force.item():.4f} "
+                f"| 平滑: {ema_loss:.4f} "
                 f"| Best: {best_loss:.4f} "
-                f"| sym loss: {loss_sym:.4f} "  # 顺手加了 .4f 限制一下小数位数，版面更整洁
-                f"| LR: {optimizer.param_groups[0]['lr']:.2e}")
+                f"| sym loss: {loss_sym:.4f} "
+                f"| LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
 
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),

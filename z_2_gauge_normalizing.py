@@ -88,7 +88,7 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'final_normalizing_32_abs',
+    'type': 'gauge_covariant_conv_32',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -111,7 +111,8 @@ CONFIG = {
     # 🌟 核心修改：支持列表，按 U-Net "沙漏" 风格设计，中间层更深更宽
     # 如果用单个整数（如 96），则兼容旧版，所有层全部为 96
     # 'trunk_channels': [128, 128, 128, 128, 128, 128],
-    'trunk_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32], # 64通道参数
+    'trunk_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32], # 32通道参数
+    # 'trunk_channels': [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,], # 32通道参数
     # 'trunk_channels': [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
     'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
     'trunk_use_multi_kernel': True,
@@ -122,12 +123,14 @@ CONFIG = {
 
     # 🌟 S 分支也支持逐层调控，首尾较浅，中间较深
     's_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
+    # 's_head_channels': [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
     # 's_head_channels': [8, 8, 8, 8, 8, 8],
     's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     's_head_kernel_size': 3,
 
     # 🌟 T 分支同理
     't_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
+    # 't_head_channels': [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
     # 't_head_channels': [8, 8, 8, 8, 8, 8],
     't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
@@ -354,6 +357,162 @@ class ConvContextNet(nn.Module):
         return torch.cat([s_out, t_out], dim=1)
 
 
+
+
+# ==========================================
+# 3.1 规范等变卷积网络：Z2 Gauge-Covariant Context Net
+# ==========================================
+
+class CovariantConv2d(nn.Module):
+    """
+    Z2 格点规范协变卷积层。
+
+    输入:
+        x  : [B, C_in, L, L] 协变特征场，满足 x_x -> eta_x x_x
+        U1 : [B, 1, L, L] x方向 link, U1_x = g_x g_{x+hat1}
+        U2 : [B, 1, L, L] y方向 link, U2_x = g_x g_{x+hat2}
+
+    输出:
+        out: [B, C_out, L, L] 协变特征场，满足 out_x -> eta_x out_x
+
+    重要:
+        所有 1x1 conv 必须 bias=False，否则 bias 项不协变。
+    """
+    def __init__(self, in_channels, out_channels, zero_init=False):
+        super().__init__()
+
+        self.w_self = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.w_right = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.w_left = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.w_up = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.w_down = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+
+        self._initialize_weights(zero_init=zero_init)
+
+    def _initialize_weights(self, zero_init=False):
+        layers = [self.w_self, self.w_right, self.w_left, self.w_up, self.w_down]
+
+        if zero_init:
+            for layer in layers:
+                nn.init.zeros_(layer.weight)
+        else:
+            for layer in layers:
+                nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+
+    def forward(self, x, U1, U2):
+        # 周期边界下的邻居特征
+        x_right = torch.roll(x, shifts=-1, dims=3)
+        x_left  = torch.roll(x, shifts=1, dims=3)
+        x_up    = torch.roll(x, shifts=-1, dims=2)
+        x_down  = torch.roll(x, shifts=1, dims=2)
+
+        # 后向 link: U_{x-hatmu, mu}
+        U1_left = torch.roll(U1, shifts=1, dims=3)
+        U2_down = torch.roll(U2, shifts=1, dims=2)
+
+        # Z2 平行移动：把邻居特征搬运到 x 点的局域 frame
+        msg_right = U1 * x_right
+        msg_left  = U1_left * x_left
+        msg_up    = U2 * x_up
+        msg_down  = U2_down * x_down
+
+        out = (
+            self.w_self(x)
+            + self.w_right(msg_right)
+            + self.w_left(msg_left)
+            + self.w_up(msg_up)
+            + self.w_down(msg_down)
+        )
+
+        return out
+
+
+class GaugeEquivariantContextNet(nn.Module):
+    """
+    Gauge-equivariant context network for affine coupling.
+
+    输出:
+        s_out: gauge-invariant scale field
+        t_out: gauge-covariant translation field
+
+    结构:
+        1. covariant trunk: h -> eta h
+        2. t_head: covariant conv, 输出 t -> eta t
+        3. s_head: 对 h^2 做普通 CNN, 输出 invariant s
+    """
+    def __init__(
+        self,
+        channels=32,
+        layers=3,
+        s_head_channels=32,
+        s_head_layers=1,
+        t_zero_init=True,
+        s_zero_init=True,
+    ):
+        super().__init__()
+
+        self.channels = channels
+        self.layers = layers
+
+        # 协变主干
+        self.cov_layers = nn.ModuleList()
+        for i in range(layers):
+            in_ch = 1 if i == 0 else channels
+            self.cov_layers.append(
+                CovariantConv2d(in_ch, channels, zero_init=False)
+            )
+
+        # t 分支：必须保持协变，因此仍用 CovariantConv2d
+        # 最后一层建议 zero init，让 flow 初始接近 identity
+        self.t_head = CovariantConv2d(channels, 1, zero_init=t_zero_init)
+
+        # s 分支：输入是 h^2，是 gauge-invariant，所以可以用普通 CNN
+        s_layers = [
+            nn.Conv2d(
+                channels,
+                s_head_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode='circular',
+            ),
+            nn.LeakyReLU(0.1),
+        ]
+
+        for _ in range(s_head_layers):
+            s_layers.append(
+                ResBlock(
+                    s_head_channels,
+                    kernel_size=3,
+                    branch_depth=1,
+                )
+            )
+
+        s_layers.append(nn.Conv2d(s_head_channels, 1, kernel_size=1))
+        self.s_head = nn.Sequential(*s_layers)
+
+        if s_zero_init:
+            nn.init.zeros_(self.s_head[-1].weight)
+            if self.s_head[-1].bias is not None:
+                nn.init.zeros_(self.s_head[-1].bias)
+
+    def forward(self, varphi_a, U1, U2):
+        # 1. 协变主干：每一层都保持 h_x -> eta_x h_x
+        h = varphi_a
+        for cov_conv in self.cov_layers:
+            h = torch.tanh(cov_conv(h, U1, U2))
+            # tanh 是奇函数，因此保持 Z2 协变性
+
+        # 2. t_out: 协变 translation
+        t_out = self.t_head(h, U1, U2)
+
+        # 3. s_out: 先构造 invariant，再用普通 CNN
+        h_inv = h ** 2
+        s_out = self.s_head(h_inv)
+
+        return s_out, t_out
+
+
+
 # ==========================================
 # 4. 自由场先验
 # ==========================================
@@ -405,27 +564,20 @@ class FlowModel(nn.Module):
             return val  # 兼容单数字配置
 
         for i in range(self.cnn_layers):
-            self.context_nets.append(ConvContextNet(
-                trunk_channels=get_layer_cfg('trunk_channels', 64, i),
-                trunk_layers=get_layer_cfg('trunk_layers', 3, i),
-                trunk_use_multi_kernel=config.get('trunk_use_multi_kernel', True),
-                trunk_kernel_sizes=config.get('trunk_kernel_sizes', (3, 3)),
-                trunk_dilations=config.get('trunk_dilations', (1, 2)),
-
-                s_head_channels=get_layer_cfg('s_head_channels', 32, i),
-                s_head_layers=get_layer_cfg('s_head_layers', 1, i),
-
-                t_head_channels=get_layer_cfg('t_head_channels', 32, i),
-                t_head_layers=get_layer_cfg('t_head_layers', 1, i),
-
-                t_kernel_size=config.get('t_kernel_size', 3),
-                s_head_kernel_size=config.get('s_head_kernel_size', 3),
-                branch_depth=config.get('branch_depth', 2)
-            ))
+            self.context_nets.append(
+                GaugeEquivariantContextNet(
+                    channels=get_layer_cfg('trunk_channels', 32, i),
+                    layers=get_layer_cfg('trunk_layers', 3, i),
+                    s_head_channels=get_layer_cfg('s_head_channels', 32, i),
+                    s_head_layers=get_layer_cfg('s_head_layers', 1, i),
+                    t_zero_init=True,
+                    s_zero_init=True,
+                )
+            )
 
         # 🌟 修改控制台打印，展示动态结构
         print("=" * 70)
-        print(f"🌟 Variable Shared-Trunk (Y-Net) 物理流模型初始化完毕！")
+        print(f"🌟 Z2 Gauge-Covariant Flow 模型初始化完毕！")
         print(f"👉 耦合层数: {self.total_layers} 层 (双步复用) | 分支深度: {config.get('branch_depth', 2)}")
         print("   ├─ [层级分布日志]:")
         for i in range(self.cnn_layers):
@@ -459,46 +611,73 @@ class FlowModel(nn.Module):
         #     self.t_bounds[0].fill_(-100.0)
         #     self.t_bounds[1].fill_(100.0)
 
-    def forward(self, z, progress=None, enforce_sym=False):
-        phi = z
-        log_det_jacobian = 0
+    def forward(self, z, progress=None, enforce_sym=False, g=None):
+        """
+        Gauge-covariant lifted flow.
 
-        # 🌟 核心修改：去除双循环，直接遍历 context_nets，让 6 个网络独立跑 6 步
+        输入:
+            z: lifted prior field, 推荐训练时使用 z_lift = g * z_phys
+            g: local Z2 frame, shape [B, 1, L, L]
+
+        输出:
+            varphi: lifted field
+            log_det_jacobian
+            g
+        """
+        varphi = z
+
+        log_det_jacobian = torch.zeros(
+            z.shape[0],
+            device=z.device,
+            dtype=z.dtype,
+        )
+
+        # 1. 局域 frame g_x
+        if g is None:
+            g = (torch.rand_like(z) > 0.5).float() * 2.0 - 1.0
+
+        # 2. pure-gauge link variables
+        # U1_x = g_x g_{x+hat1}
+        # U2_x = g_x g_{x+hat2}
+        U1 = g * torch.roll(g, shifts=-1, dims=3)
+        U2 = g * torch.roll(g, shifts=-1, dims=2)
+
         for step, net in enumerate(self.context_nets):
-            # 偶数步使用基础掩码，奇数步使用反转掩码
             current_mask = self.base_mask if step % 2 == 0 else (1.0 - self.base_mask)
-            phi_frozen = current_mask * phi
-
-            if enforce_sym:
-                # 🌟 核心逻辑：分别跑一次 z 和 -z
-                st_out_pos = net(phi_frozen)
-                st_out_neg = net(-phi_frozen)
-
-                s_out_pos, t_out_pos = st_out_pos[:, 0:1, :, :], st_out_pos[:, 1:2, :, :]
-                s_out_neg, t_out_neg = st_out_neg[:, 0:1, :, :], st_out_neg[:, 1:2, :, :]
-
-                # 强制 s 为偶函数: (s(z) + s(-z)) / 2
-                s_out = (s_out_pos + s_out_neg) / 2.0
-                # 强制 t 为奇函数: (t(z) - t(-z)) / 2
-                t_out = (t_out_pos - t_out_neg) / 2.0
-            else:
-                # 原始逻辑
-                st_out = net(phi_frozen)
-                s_out, t_out = st_out[:, 0:1, :, :], st_out[:, 1:2, :, :]
-
-            # 🌟 无条件、永久生效的绝对防御！
-            s_clamped = asymmetric_soft_clamp(s_out, self.s_bounds[0], self.s_bounds[1])
-            t_clamped = self.t_bounds[1] * torch.tanh(t_out / self.t_bounds[1])
-            s_out = s_clamped
-            t_out = t_clamped
-
+            current_mask = current_mask.to(dtype=varphi.dtype, device=varphi.device)
             update_mask = 1.0 - current_mask
 
-            # 🌟 统一仿射公式为逆向方程： y = (x - t) * exp(-s)
-            phi = phi_frozen + update_mask * ((phi - t_out) * torch.exp(-s_out))
-            log_det_jacobian += torch.sum(update_mask * (-s_out), dim=(1, 2, 3))
+            # frozen part
+            varphi_frozen = current_mask * varphi
 
-        return phi, log_det_jacobian
+            # 3. Gauge-equivariant context net
+            # s_out: invariant
+            # t_out: covariant
+            s_out, t_out = net(varphi_frozen, U1, U2)
+
+            # 4. 防爆盾
+            s_out = asymmetric_soft_clamp(
+                s_out,
+                self.s_bounds[0],
+                self.s_bounds[1],
+            )
+
+            # tanh 是奇函数，因此不会破坏 t_out 的协变性
+            t_out = self.t_bounds[1] * torch.tanh(t_out / self.t_bounds[1])
+
+            # 5. affine coupling update
+            # varphi -> (varphi - t) exp(-s)
+            # s invariant, t covariant, 所以该层 gauge-covariant
+            varphi = varphi_frozen + update_mask * (
+                    (varphi - t_out) * torch.exp(-s_out)
+            )
+
+            log_det_jacobian += torch.sum(
+                update_mask * (-s_out),
+                dim=(1, 2, 3),
+            )
+
+        return varphi, log_det_jacobian, g
 
 
 def asymmetric_soft_clamp(x, min_val, max_val):
@@ -541,10 +720,23 @@ def run_mcmc_evaluation(model, prior, total_n=10000, batch_size=1024, enforce_sy
     with torch.no_grad():
         for i in range(0, total_n, batch_size):
             current_batch = min(batch_size, total_n - i)
-            z, log_p_z = prior.sample(current_batch)
-            phi, log_det_J = model(z, dummy_progress, enforce_sym=enforce_sym)
 
-            # 🌟 新增：记录下所有的提案 phi
+            # 1. 采样物理自由场 (保留完美空间关联)
+            z_phys, log_p_z = prior.sample(current_batch)
+
+            # 2. 🌟 测试时直接固定规范为 1
+            g = torch.ones_like(z_phys)
+
+            # 3. 🌟 Lift 到冗余空间 (保证逻辑统一)
+            z_lift = g * z_phys
+
+            # 4. 模型前向传播 (输入 Lifted 场 z_lift)
+            varphi, log_det_J, _ = model(z_lift, dummy_progress, enforce_sym=enforce_sym, g=g)
+
+            # 5. 恢复物理场
+            phi = g * varphi
+
+            # 后面直接使用 phi 即可
             all_phis[i:i + current_batch] = phi
             all_s[i:i + current_batch] = compute_action(phi)
             all_log_qs[i:i + current_batch] = log_p_z - log_det_J
@@ -719,7 +911,15 @@ def train():
     model.train()
     for iteration in range(start_iteration, CONFIG['iterations'] + 1):
         optimizer.zero_grad()
-        z, log_p_z = prior.sample(CONFIG['batch_size'])
+
+        # 1. 采样物理自由场 z_phys (这里包含了完美的动量空间长程关联)
+        z_phys, log_p_z = prior.sample(CONFIG['batch_size'])
+
+        # 2. 采样完全随机的局域规范场 g
+        g = (torch.rand_like(z_phys) > 0.5).float() * 2.0 - 1.0
+
+        # 3. 🌟 核心修正：将物理先验赋予提升场 (Gauge-Modulated Prior)
+        z_lift = g * z_phys
 
         warmup_steps = CONFIG['warmup_steps']
         progress_val = min(iteration / warmup_steps, 1.0)
@@ -729,8 +929,13 @@ def train():
         # 🌟 新增：动态判断当前是否需要开启强制对称性
         enforce_sym = CONFIG.get('enforce_z2_sym', False) and (iteration >= CONFIG.get('sym_start_iter', 0))
 
-        # 🌟 修改：将 enforce_sym 传给模型
-        phi, log_det_J = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
+        # 4. 传入模型 (⚠️ 注意这里传入的是 z_lift，而不是原始先验)
+        varphi, log_det_J, _ = compiled_model(z_lift, progress_tensor, enforce_sym=enforce_sym, g=g)
+
+        # 5. 🌟 恢复为物理场，直接喂给 Action
+        phi = g * varphi
+
+        # 注意：这里用的依然是物理场 z_phys 算出来的 log_p_z
         loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
         loss.backward()
 
