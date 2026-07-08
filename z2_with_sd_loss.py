@@ -6,6 +6,11 @@ import math
 import numpy as np
 import os
 import glob
+import torch._functorch.config  # 🌟 新增：引入底层配置库
+
+# 🌟 新增：关闭 compile 的显存捐赠机制，允许 retain_graph=True
+torch._functorch.config.donated_buffer = False
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -88,8 +93,7 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    # 'type': 'enf_z2_from_step0_final_normalizing_32',
-    'type': 'final_normalizing_32',
+    'type': 'project_z2_with_local_z2_loss',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -101,11 +105,13 @@ CONFIG = {
     'scheduler_steps': 30000,
     'warmup_steps': 12000.0,
     'target_acc_ratio': 0.78,
-    # 'load_from': 'iter_30000_final_normalizing_32_dp_False_L14_c12_d2_TrCh32x12_Ly3x12_trk_3_dil_1_Sh32x12L1x12_Th32x12L1x12_iter_100000.pt',
+    # 🌟 新增：强制加载指定断点的路径。如果填 None 或 ""，则自动搜索最新断点
+    # 'load_from': 'iter_4000_z2_with_sd_loss_dp_False_L14_c12_d2_TrCh32x12_Ly3x12_trk_3_dil_1_Sh32x12L1x12_Th32x12L1x12_iter_100000.pt',   # 例如: 'iter_10000_z2_with_local_z2_loss_dp_False_..._iter_100000.pt'
     'load_from': None,
+    'enforce_z2_sym': False,
+    'sym_start_iter': 30000,
+    'lambda_sd': 0.1,         # 离散 S-D 动力学惩罚权重 (数值可能较大，权重可以设小一点)
 
-    'enforce_z2_sym': True,
-    'sym_start_iter': 0,
 
     'cnn_coupling_layers': 12,
     'branch_depth': 2,
@@ -187,6 +193,79 @@ def compute_action(phi):
     laplacian = F.conv2d(phi_padded, adaptive_kernel)
     action_density = phi * laplacian + CONFIG['m_sq'] * (phi ** 2) + CONFIG['lam'] * (phi ** 4)
     return torch.sum(action_density, dim=(1, 2, 3))
+
+
+# ==========================================
+# 新增：离散 Schwinger-Dyson 物理约束 (Z_2 的终极形态)
+# ==========================================
+# 新增：局域 Z2 符号伪似然约束 (Local Z2 Pseudo-likelihood)
+# 替代原先会引发方差爆炸的 Flip-SD Loss
+# ==========================================
+# 定义邻居提取卷积核 (上下左右四个邻居为1，中心为0)
+neighbor_kernel = torch.tensor([[
+    [0.0, 1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0]
+]], device=device, dtype=torch.float64 if CONFIG.get('double_precision', False) else torch.float32).unsqueeze(1)
+
+
+def compute_local_z2_sign_loss(phi):
+    adaptive_nk = neighbor_kernel.to(dtype=phi.dtype, device=phi.device)
+
+    # 提取周围邻居的和： \sum_{y \sim x} \phi_y
+    phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
+    sum_neighbors = F.conv2d(phi_padded, adaptive_nk)
+
+    # 计算局域符号对齐的 Logits: 4.0 * \phi_x * \sum \phi_y
+    # 在双势阱中，如果符号符合物理动力学，这个值应该趋向正数
+    logits = 4.0 * phi * sum_neighbors
+
+    # -log(sigmoid(logits)) = softplus(-logits)
+    # 这个函数极其平滑，不会像 exp() 那样发生数值爆炸
+    loss = F.softplus(-logits)
+
+    # 取全局平均，作为极弱的正则项引导模型
+    return loss.mean()
+
+
+# ==========================================
+# 实验 B 工具：局域符号热浴扫掠 (Sign Heatbath Sweep)
+# 专治 "幅度正确但符号全错" 的高能物理构型
+# ==========================================
+def sample_sign_checkerboard(r, s, mask, adaptive_nk):
+    phi = r * s
+    phi_padded = F.pad(phi, pad=(1, 1, 1, 1), mode='circular')
+    h = F.conv2d(phi_padded, adaptive_nk)
+
+    # 物理精确的局域符号条件概率
+    logits = 4.0 * r * h
+    prob_plus = torch.sigmoid(logits)
+
+    u = torch.rand_like(prob_plus)
+    s_new = torch.where(u < prob_plus, torch.ones_like(s), -torch.ones_like(s))
+
+    return mask * s_new + (1.0 - mask) * s
+
+
+def sign_heatbath_sweep(phi):
+    r = phi.abs()
+    s = torch.sign(phi)
+    s = torch.where(s == 0, torch.ones_like(s), s)
+
+    # 生成黑白棋盘掩码
+    L = phi.shape[-1]
+    indices = torch.arange(L, device=phi.device)
+    mask_2d = (indices[:, None] + indices[None, :]) % 2 == 0
+    white_mask = mask_2d.view(1, 1, L, L).to(dtype=phi.dtype, device=phi.device)
+    black_mask = 1.0 - white_mask
+
+    adaptive_nk = neighbor_kernel.to(dtype=phi.dtype, device=phi.device)
+
+    # 交替更新黑白格子的符号 (固定幅度 r 不变)
+    s = sample_sign_checkerboard(r, s, black_mask, adaptive_nk)
+    s = sample_sign_checkerboard(r, s, white_mask, adaptive_nk)
+
+    return r * s
 
 
 # ==========================================
@@ -653,6 +732,7 @@ def train():
             print(f"\n🔍 [自动加载] 已自动搜索到历史最新断点，将从此处恢复: \n   -> {old_checkpoint_path}")
         else:
             print("\n🌱 [全新起步] 未找到任何可用断点，开始从头训练...")
+
     if old_checkpoint_path and os.path.exists(old_checkpoint_path):
         print(f"从 {old_checkpoint_path} 恢复训练...")
         checkpoint = torch.load(old_checkpoint_path, map_location=device)
@@ -746,17 +826,120 @@ def train():
         model.step_warmup(progress_val)
         progress_tensor = torch.tensor(progress_val, device=device, dtype=dtype)
 
-        # 🌟 新增：动态判断当前是否需要开启强制对称性
+        # 🌟 动态判断当前是否需要开启强制对称性
         enforce_sym = CONFIG.get('enforce_z2_sym', False) and (iteration >= CONFIG.get('sym_start_iter', 0))
 
-        # 🌟 修改：将 enforce_sym 传给模型
-        phi, log_det_J = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
-        loss = torch.mean((log_p_z - log_det_J) + compute_action(phi))
-        loss.backward()
+        # ==========================================
+        # 🌟 0. 安全梯度探测器 (每 1000 步测一次，计算图完全物理隔离！)
+        # ==========================================
+        # if iteration % 100 == 0:
+        #     # 探测 A: 基础变分 Loss 的真实梯度
+        #     phi_probe1, log_det_J_probe1 = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
+        #     loss_base_probe = torch.mean((log_p_z - log_det_J_probe1) + compute_action(phi_probe1))
+        #     optimizer.zero_grad()
+        #     loss_base_probe.backward()  # 绝不使用 retain_graph
+        #     grad_norm_base = torch.norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None]))
+        #
+        #     # 探测 B: 局域 Z2 伪似然约束的真实梯度
+        #     phi_probe2, _ = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
+        #     loss_z2_probe = compute_local_z2_sign_loss(phi_probe2)
+        #     optimizer.zero_grad()
+        #     loss_z2_probe.backward()  # 绝不使用 retain_graph
+        #     grad_norm_z2 = torch.norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None]))
+        #
+        #     optimizer.zero_grad()  # 彻底清空探测阶段的残余梯度，保证正式训练极其干净！
+        #
+        #     suggested_lambda = (grad_norm_base / (grad_norm_z2 + 1e-8)).item()
+        #     print(f"\n🔍 [梯度探测] 基础 KL 梯度: {grad_norm_base:.4f} | 局域 Z2 原始梯度: {grad_norm_z2:.4f}")
+        #     print(f"💡 [1:1 对齐建议] 若要梯度量级完全相等，lambda 应设为 {suggested_lambda:.4e}")
+        #     print(f"🛡️ [安全提醒] 作为辅助正则，实际使用值建议设为对齐值的 1/10 到 1/100 左右，以防铁磁坍缩！\n")
 
-        # 🌟 新增：在不追踪梯度的线下，计算当前轮次输出 phi 的 1, 2, 5 次幂期望值
+        # ==========================================
+        # 🌟 1. 正式的训练前向传播
+        # ==========================================
+        phi, log_det_J = compiled_model(z, progress_tensor, enforce_sym=enforce_sym)
+
+        # 基础变分 Loss (KL divergence + Action)
+        loss_base = torch.mean((log_p_z - log_det_J) + compute_action(phi))
+
+        # 计算局域 Z2 符号惩罚 (Softplus 版本)
+        loss_z2_local_raw = compute_local_z2_sign_loss(phi)
+
+        # ==========================================
+        # 🌟 2. 极弱正则变速箱 (严禁将权重开得过大！)
+        # ==========================================
+        if iteration < 5000:
+            lambda_z2_local = 1  # 阶段一：完全不干预
+        elif iteration < 10000:
+            lambda_z2_local = 1e-1  # 阶段二：极弱引导
+        elif iteration < 20000:
+            lambda_z2_local = 1e-2
+        else:
+            lambda_z2_local = 0  # 阶段三：轻微加强
+
+        loss_z2_local = lambda_z2_local * loss_z2_local_raw
+
+        # 为控制台日志留档
+        loss_sd_val = loss_z2_local.item()
+        loss_val = loss_base.item()
+
+        # ==========================================
+        # 🌟 3. PCGrad 梯度正交投影组装 (防冲突屏蔽器)
+        # ==========================================
+        optimizer.zero_grad()
+
+        if lambda_z2_local > 0.0:
+            # 步骤 A：计算 Base Loss 的梯度，并保留计算图
+            loss_base.backward(retain_graph=True)
+
+            # 收集并克隆 base_grad
+            base_grads = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    base_grads.append(p.grad.clone())
+                else:
+                    base_grads.append(None)
+
+            # 清空 .grad 属性，为下一个 backward 腾出空间
+            optimizer.zero_grad()
+
+            # 步骤 B：计算 SD Loss 的梯度 (此时计算图将被自动释放)
+            loss_z2_local.backward()
+
+            # 步骤 C：计算内积与 Base 梯度的模长
+            dot_product = 0.0
+            base_norm_sq = 0.0
+
+            for p, g_base in zip(model.parameters(), base_grads):
+                if p.grad is not None and g_base is not None:
+                    dot_product += torch.sum(p.grad * g_base)
+                    base_norm_sq += torch.sum(g_base * g_base)
+
+            # 🌟 步骤 D：冲突判断与投影
+            # 只有当 dot_product < 0 (也就是两个梯度方向夹角大于90度，产生冲突) 时，才执行剔除
+            if dot_product < 0:
+                proj_coef = dot_product / (base_norm_sq + 1e-8)
+            else:
+                proj_coef = 0.0  # 如果不冲突，则不投射，直接相加
+
+            # 步骤 E：重新合并梯度并正式写入模型参数
+            for p, g_base in zip(model.parameters(), base_grads):
+                if p.grad is not None and g_base is not None:
+                    # 剔除掉 SD 梯度中破坏 Base 梯度的分量
+                    g_sd_orthogonal = p.grad - proj_coef * g_base
+
+                    # 最终的参数梯度 = 主梯度 + 经过驯化的 SD 梯度
+                    p.grad = g_base + g_sd_orthogonal
+        else:
+            # 如果不激活正则项，直接进行常规的反向传播
+            loss_base.backward()
+
+        # 为控制台日志留档
+        loss_sd_val = loss_z2_local.item()  # 复用这个变量名，方便打印
+        loss_val = loss_base.item()
+
+        # 🌟 4. 统计物理指标期望值
         with torch.no_grad():
-            # 分别对 Batch 维度(0)和格点空间维度(1,2,3)求均值
             current_phi1 = torch.mean(phi).item()
             current_phi3 = torch.mean(phi ** 3).item()
             current_phi5 = torch.mean(phi ** 5).item()
@@ -765,13 +948,12 @@ def train():
         history_phi3.append(current_phi3)
         history_phi5.append(current_phi5)
 
-        # 🌟 修改点：方案 A - 全局宏观磁化率惩罚 (Global Magnetization Penalty)
-        # 计算整个 Batch 内所有样本、所有格点的平均场值，并惩罚其平方
-        # 🌟 修正：补偿体积因子，对齐 Action 的广延量级
+        # 宏观磁化率惩罚计算 (纯日志，不进反向传播)
         V = CONFIG['L'] * CONFIG['L']
         batch_mag = torch.mean(phi)
         loss_sym = V * (batch_mag ** 2)
 
+        # 🌟 5. 梯度裁剪与参数更新
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             print("⚠️ 捕获到 NaN 梯度！跳过本次更新。")
@@ -780,28 +962,29 @@ def train():
         else:
             optimizer.step()
 
-        # 🌟 修改：只在前 25000 步推进 scheduler，之后停止推进并维持当前学习率
         if scheduler and iteration <= CONFIG['scheduler_steps']:
             scheduler.step()
         elif iteration == CONFIG['scheduler_steps'] + 1:
             print(
-                f"🔄 调度器已完成前 {CONFIG['scheduler_steps']} 步降速，后续 10000 步学习率将固定在: {optimizer.param_groups[0]['lr']:.2e}")
+                f"🔄 调度器已完成前 {CONFIG['scheduler_steps']} 步降速，后续学习率将固定在: {optimizer.param_groups[0]['lr']:.2e}")
 
-        loss_val = loss.item()
         history_loss.append(loss_val)
         ema_loss = loss_val if ema_loss is None else 0.95 * ema_loss + 0.05 * loss_val
 
+        # ==========================================
+        # 🚨 6. 干净的日志打印环节 (旧幽灵代码已剿灭)
+        # ==========================================
         if iteration % 100 == 0:
-            # 🌟 新增：判断当前 Z_2 对称性是否处于开启状态
             z2_status = "ON" if enforce_sym else "OFF"
 
             print(
                 f"迭代 {iteration:6d}/{CONFIG['iterations']} "
-                f"| Z_2: {z2_status} "  # 🌟 加在这里，一目了然
+                f"| Z_2: {z2_status} "
                 f"| 瞬时 Loss: {loss_val:.4f} "
                 f"| 平滑 Loss: {ema_loss:.4f} "
                 f"| Best: {best_loss:.4f} "
-                f"| sym loss: {loss_sym:.4f} "  # 顺手加了 .4f 限制一下小数位数，版面更整洁
+                f"| 局域Z2惩罚: {loss_sd_val:.4f} "
+                f"| sym loss: {loss_sym.item() / V:.4f} "
                 f"| LR: {optimizer.param_groups[0]['lr']:.2e}")
 
             torch.save({'iteration': iteration, 'model_state_dict': model.state_dict(),
@@ -809,13 +992,14 @@ def train():
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                         'loss': loss_val, 'best_loss': best_loss,
                         'history_loss': history_loss,
-                        # 🌟 新增写入
                         'history_phi1': history_phi1,
                         'history_phi3': history_phi3,
                         'history_phi5': history_phi5,
                         'ema_loss': ema_loss,
                         'achieved_milestones': achieved_milestones},
                        checkpoint_path)
+
+        # ======= 紧接着就是原有的 if iteration % 2000 == 0 的保存代码 =======
 
         if ema_loss < best_loss and iteration >= 10000:
             best_loss = ema_loss

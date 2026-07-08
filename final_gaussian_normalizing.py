@@ -88,7 +88,7 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'gaussian_normalizing_64_18',
+    'type': 'gaussian_normalizing',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -104,16 +104,16 @@ CONFIG = {
     'enforce_z2_sym': False,
     'sym_start_iter': 30000,
 
-    'cnn_coupling_layers': 18,
+    'cnn_coupling_layers': 12,
     'branch_depth': 2,
     'double_precision': False,
 
     # 🌟 核心修改：支持列表，按 U-Net "沙漏" 风格设计，中间层更深更宽
     # 如果用单个整数（如 96），则兼容旧版，所有层全部为 96
     # 'trunk_channels': [128, 128, 128, 128, 128, 128],
-    'trunk_channels': [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64], # 64通道参数
+    'trunk_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32], # 64通道参数
     # 'trunk_channels': [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
-    'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    'trunk_layers': [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
     'trunk_use_multi_kernel': True,
     'trunk_kernel_sizes': (3, ),# 64通道参数
     'trunk_dilations': (1, ),# 64通道参数
@@ -121,15 +121,15 @@ CONFIG = {
     # 'trunk_dilations': (1, ),
 
     # 🌟 S 分支也支持逐层调控，首尾较浅，中间较深
-    's_head_channels': [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
+    's_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
     # 's_head_channels': [8, 8, 8, 8, 8, 8],
-    's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    's_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     's_head_kernel_size': 3,
 
     # 🌟 T 分支同理
-    't_head_channels': [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
+    't_head_channels': [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32],
     # 't_head_channels': [8, 8, 8, 8, 8, 8],
-    't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    't_head_layers': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     't_kernel_size': 3,
 }
 
