@@ -19,15 +19,15 @@ try:
 
     # 绘制实验 A
     plt.plot(steps_A, acc_A * 100, marker='o', linestyle='-', linewidth=2,
-             label='Exp A: Pure Kinetic action', color='#1f77b4')
+             label='Exp A: Kinetic action', color='#1f77b4')
 
     # 绘制实验 B
-    plt.plot(steps_B, acc_B * 100, marker='s', linestyle='-', linewidth=2,
-             label='Exp B: Pure Potential action', color='#d62728')
+    plt.plot(steps_B, acc_B * 100, marker='s', linestyle='--', linewidth=2,
+             label='Exp B: Potential action', color='#d62728')
 
     # 细节设置
     plt.title('MCMC Acceptance Rate Comparison', fontsize=15, fontweight='bold')
-    plt.xlabel('Training Iterations', fontsize=12)
+    plt.xlabel('Training Steps', fontsize=12)
     plt.ylabel('Acceptance Rate (%)', fontsize=12)
 
     # 设置 y 轴范围，由于最高是 87.67%，范围设在 0-100 比较合适

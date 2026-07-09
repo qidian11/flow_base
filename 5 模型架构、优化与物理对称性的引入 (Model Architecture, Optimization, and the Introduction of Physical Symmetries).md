@@ -92,6 +92,53 @@ $$\theta\leftarrow\theta-\eta\nabla_{\theta}\mathcal{L}(\theta)$$
 
 其中 $\eta$ 是学习率。使用这些更新的参数，网络重新计算球在表面上的新位置。通过重复前向传播、损失评估、反向传播和参数更新，网络逐渐学习到更好的映射。由于参数空间 $\theta$ 极其庞大，人们开发了许多先进的优化方法来有效地在此高维表面上导航。在本文中，我们跳过反向传播复杂的数学细节；在标准的机器学习教科书中可以找到全面的讨论和推导。
 
+
+
+
+
+## 参数优化与神经网络的训练
+
+正如前文所述，神经网络可以表示为一个参数化函数 $F_\theta(\mathbf{x})$，其中 $\mathbf{x}$ 为输入，$\theta$ 表示网络中所有可训练参数。引入这一函数是为了完成特定的任务。在一般的机器学习问题中，$F_\theta(\mathbf{x})$ 可以用于预测标签、逼近未知函数，或将输入数据转换为所期望的输出形式。
+
+在本文中，$F_\theta$ 作为归一化流（Normalizing Flow）的一部分，其作用是将从简单先验分布$r(\mathbf{z})$中采样得到的样本$\mathbf{z}$映射为场构型（field configurations）$\phi \sim q_\theta(\phi)$，使其尽可能逼近目标分布$p(\phi)$。因此我们必须构造一个函数$\mathcal{L}_\theta$来衡量输出分布$q_\theta(\phi)$和目标分布$p(\phi)$有多“接近”，我们把这个函数称作loss function，并且我们要求在$\mathcal{L}_\theta$最小值处，$q_\theta = p(\phi)$.这样我们只要让神经网络训练参数$\theta$让$\mathcal{L}_\theta$的值不断减小，我们就可以让$q_\theta(\phi)$不断地逼近目标分布$p(\phi)$。
+
+神经网络的训练过程通常由两个阶段组成，即**前向传播（forward propagation）\**和\**反向传播（backward propagation）**。为了更直观地理解这一过程，我们可以借助一个物理系统作类比：设想一个小球在由参数空间 $\theta$ 所定义的高维势能面上运动，如图 \ref{fig:forward_backward} 所示。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.6\textwidth]{forward_and_backward.png}
+    \caption{A physical analogy of the optimization process. Forward propagation determines the ball's current position and potential energy (loss). Backward propagation calculates the negative gradient, driving the parameters along the direction of steepest descent towards the target position.}
+    \label{fig:forward_backward}
+\end{figure}
+
+在前向传播过程中，输入数据依次经过网络各层的变换，最终得到模型输出，并且根据输出计算出来当前的$\mathcal{L}_\theta$的值。在上述物理类比中，这一步相当于计算小球当前位于势能面上的位置。损失函数衡量生成分布与目标玻尔兹曼分布之间的差异，因此可以看作当前参数位置所对应的势能大小。
+
+在反向传播过程中，利用链式法则（chain rule）计算损失函数关于各层参数的梯度，即$\nabla_\theta \mathcal{L}(\theta).$
+
+从数学上讲，梯度向量始终指向函数增长最快的方向，即最速上升方向。因此，为了最小化损失函数，我们需要沿着梯度的反方向，即负梯度$-\nabla_\theta \mathcal{L}(\theta),$
+
+来更新参数。
+$$
+\theta \leftarrow \theta-\eta\nabla_\theta\mathcal{L}(\theta),
+$$
+从物理角度来看，这对应于势能面上的最速下降方向，也就是小球下降最快的路径。接下来小球的位置随之来到了更新后的位置，也更加接近$\mathcal{L}_\theta$函数的最小值。
+
+在机器学习中，这一优化过程（前向传播+反向传播）称为**训练（training）**，在本文中，我们把一次完整的前向传播+反向传播称为一个step。
+
+由于参数空间 $\theta$ 通常具有极高的维度，因此研究者们提出了许多先进的优化算法，以更加高效地在这一高维势能面中寻找最优解。本文不再详细介绍反向传播的数学推导过程，相关内容可参考标准机器学习教材中的系统讨论与推导。
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## 4.4 带有神经网络的标准化流细节
 
 为了构建前面介绍的可逆变换 $g$，我们利用了仿射耦合层。仿射耦合层是标准化流中广泛使用的可逆变换结构。它的核心优势在于它使得雅可比行列式的计算变得极其简单和高效。
