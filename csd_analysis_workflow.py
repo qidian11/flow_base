@@ -1,356 +1,421 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, NullLocator, NullFormatter
 import os
+import re
+import shutil
 import importlib.util
-from scipy.optimize import curve_fit
 
 # ==========================================
-# 1. 配置与高度可自定义的绘图参数 (PLOT_CONFIG)
+# 1. 绘图参数配置 (严苛纯净版 + 独立单图配置)
 # ==========================================
 PLOT_CONFIG = {
-    "style": "seaborn-v0_8-ticks",  # Matplotlib 样式主题
-    "figure_size": (13, 6),  # 整体画布大小 (宽, 高)
-    "dpi": 300,  # 图像分辨率
+    "style": "seaborn-v0_8-ticks",
+    "figure_size": (6, 5.5),  # 单张图的画布比例
+    "dpi": 300,
+    "fontsize_label": 18,
+    "fontsize_tick": 15,
+    "fontsize_legend": 13,
 
-    # 磁化率与能量图的自定义配置
-    "chi2": {
-        "title": r"Critical Slowing Down: Susceptibility $\chi_2$",
-        "xlabel": r"Lattice Size $L$",
-        "ylabel": r"Integrated Autocorrelation Time $\tau_{int}(\chi_2)$",
-        "x_limits": (5, 16),  # X轴范围 [xmin, xmax]
-        "y_limits": None,  # Y轴范围 (设为 None 则自动适应)
-    },
-    "E": {
-        "title": r"Critical Slowing Down: Ising Energy $E$",
-        "xlabel": r"Lattice Size $L$",
-        "ylabel": r"Integrated Autocorrelation Time $\tau_{int}(E)$",
-        "x_limits": (5, 16),
-        "y_limits": None,
-    },
+    # 强制统一的坐标轴范围与刻度
+    "x_limits": (5.5, 14.5),
+    "x_ticks": [6, 8, 10, 12, 14],
+    "y_limits": (0.4, 8.0),
+    "y_ticks": [0.5, 1, 2, 5],
 
-    # 各算法的线条、颜色、标记与标签 (可在内部随意调整)
-    "algorithms": {
-        "Local": {"color": "#E63946", "marker": "o", "linestyle": "-", "linewidth": 2.5, "label": "Local Metropolis"},
-        "HMC": {"color": "#457B9D", "marker": "s", "linestyle": "--", "linewidth": 2.5, "label": "Hybrid Monte Carlo"},
-        "NF": {"color": "#2A9D8F", "marker": "^", "linestyle": "-.", "linewidth": 2.5,
-               "label": "Normalizing Flow (IMH)"}
+    "markers": {
+        "E": "o",
+        "chi2": "s",
+        "Gc0": "d"
+    },
+    "labels": {
+        "E": r"$E$",
+        "chi2": r"$\chi_2$",
+        "Gc0": r"$G_c(0)$"
     },
 
-    # 拟合虚线的全局样式
-    "fit_line": {"linestyle": ":", "linewidth": 1.5, "alpha": 0.7},
-
-    # 全局字体大小控制
-    "fontsize_title": 14,
-    "fontsize_label": 12,
-    "fontsize_tick": 11,
-    "fontsize_legend": 10
+    "colors": {
+        "HMC": "black",
+        "Local": "magenta",
+        "NF": "#7CB342"
+    }
 }
 
-# 硬件设备自动选择 (支持 CUDA 和 Intel XPU 架构)
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else ("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
 )
-print(f"🔥 当前数据生成与计算设备: {DEVICE}")
+print(f"🔥 当前计算设备: {DEVICE}")
 
 
 # ==========================================
-# 2. Normalizing Flow 模型动态加载与数据生成
+# 2. 核心 MCMC 引擎 (用于快速评估 & 百万生成)
 # ==========================================
-# ==========================================
-# 2. Normalizing Flow 模型动态加载与数据生成 (完美适配版)
-# ==========================================
-def load_nf_model_and_action(L):
-    """
-    动态导入对应的 Python 脚本，完美复用你源码中的一切类、函数和自动寻重机制。
-    """
-    if L == 14:
-        script_name = "final_normalizing.py"
-    else:
-        script_name = f"final_normalizing_L{L}.py"
-
-    if not os.path.exists(script_name):
-        raise FileNotFoundError(f"找不到模型定义脚本: {script_name}")
-
-    # 动态加载你的模块
-    spec = importlib.util.spec_from_file_location("nf_module", script_name)
-    nf_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(nf_module)
-
-    CONFIG = nf_module.CONFIG
-
-    # 1. 完美对接你的模型类 (FlowModel)
-    model = nf_module.FlowModel(CONFIG).to(DEVICE).to(torch.float64)
-
-    # 2. 完美对接你的先验分布 (兼容 L14 的硬编码 m_sq_prior 和 L6 的字典配置)
-    m_sq_prior = CONFIG.get('m_sq_prior', 0.6005269985)
-    prior = nf_module.FreeFieldPrior(CONFIG['L'], m_sq_prior).to(DEVICE).to(torch.float64)
-
-    # 3. 完美复刻你的权重搜寻逻辑
-    # 你的源码在达标后会保存为: 'mcmc_success_' + checkpoint_path
-    target_success_weight = "mcmc_success_" + CONFIG['checkpoint_path']
-
-    if os.path.exists(target_success_weight):
-        final_weight_path = target_success_weight
-        print(f"  --> 🎯 找到成功达标权重: {final_weight_path}")
-    else:
-        # 如果没有成功标志的，直接调用你源码里的自动搜寻函数找最新的
-        final_weight_path = nf_module.auto_find_latest_checkpoint(CONFIG)
-        if final_weight_path:
-            print(f"  --> 🔍 未找到 success 权重，调用内置搜索找到最新断点: {final_weight_path}")
-
-    # 4. 加载权重
-    if final_weight_path and os.path.exists(final_weight_path):
-        checkpoint = torch.load(final_weight_path, map_location=DEVICE, weights_only=False)
-        # 兼容你源码中可能的 compile 前缀
-        clean_dict = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()}
-        model.load_state_dict(clean_dict)
-    else:
-        print(f"  [严重警告] 彻底没找到任何 L={L} 的权重，将使用随机初始化的模型！")
-
-    # 5. 提取你源码中的作用量计算函数
-    action_fn = nf_module.compute_action
-
-    return model, prior, action_fn, CONFIG
-
-
-def generate_nf_mcmc_data(L, n_samples=1000000, batch_size=10000):
-    """
-    生成数据，逻辑参考了你源码中的 CPU/GPU 混合提速 MCMC。
-    """
-    model, prior, action_fn, CONFIG = load_nf_model_and_action(L)
-    model.eval()
-
+def run_mcmc_chain(model, prior, action_fn, n_samples, batch_size, enforce_sym, L):
     configurations = np.zeros((n_samples, L, L), dtype=np.float64)
-
     dummy_progress = torch.tensor(1.0, device=DEVICE, dtype=torch.float64)
-    enforce_sym = CONFIG.get('enforce_z2_sym', False)
-
-    print(f"🚀 开始为 L={L} 生成 Normalizing Flow MCMC 链...")
+    accepted_count = 0
 
     with torch.no_grad():
-        # --- 初始状态 ---
         z_curr, log_p_z_curr = prior.sample(1)
         phi_curr, log_det_J_curr = model(z_curr, dummy_progress, enforce_sym=enforce_sym)
         log_q_curr = log_p_z_curr - log_det_J_curr
         S_curr = action_fn(phi_curr)
 
-        accepted_count = 0
-
         for i in range(0, n_samples, batch_size):
             current_batch = min(batch_size, n_samples - i)
 
-            # 批量提议
             z_prop, log_p_z_prop = prior.sample(current_batch)
             phi_prop, log_det_J_prop = model(z_prop, dummy_progress, enforce_sym=enforce_sym)
-
             log_q_prop = log_p_z_prop - log_det_J_prop
             S_prop = action_fn(phi_prop)
 
-            # --- 借用你源码里的 CPU 标量判别法提速 ---
             S_np = S_prop.cpu().numpy()
             log_q_np = log_q_prop.cpu().numpy()
-
             curr_S_val = S_curr.item()
             curr_log_q_val = log_q_curr.item()
-
             log_rands = np.log(np.random.rand(current_batch))
 
             for j in range(current_batch):
                 prop_S_val = S_np[j]
                 prop_log_q_val = log_q_np[j]
-
                 log_acc_ratio = (-prop_S_val - prop_log_q_val) - (-curr_S_val - curr_log_q_val)
 
                 if log_rands[j] < log_acc_ratio:
-                    # 接受，更新标量与张量状态
                     curr_S_val = prop_S_val
                     curr_log_q_val = prop_log_q_val
                     phi_curr = phi_prop[j:j + 1]
                     S_curr = S_prop[j:j + 1]
                     log_q_curr = log_q_prop[j:j + 1]
                     accepted_count += 1
-
-                # 无论接受与否，写入构型
                 configurations[i + j] = phi_curr.cpu().numpy().reshape(L, L)
 
-            if (i + current_batch) % 200000 == 0 or (i + current_batch) == n_samples:
-                print(
-                    f"  进度: {i + current_batch}/{n_samples} | 累计接受率: {accepted_count / (i + current_batch):.2%}")
+    acc_rate = accepted_count / n_samples
+    return configurations, acc_rate
 
-    output_filename = f"NF_configs_L{L}_N1000000_DTYPE_double.npz"
+
+# ==========================================
+# 3. 严格正则匹配与 ~70% 接受率模型锁定
+# ==========================================
+def find_and_test_best_model(L):
+    script_name = "final_normalizing.py" if L == 14 else f"final_normalizing_L{L}.py"
+    if not os.path.exists(script_name):
+        raise FileNotFoundError(f"找不到模型脚本: {script_name}")
+
+    spec = importlib.util.spec_from_file_location("nf_module", script_name)
+    nf_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nf_module)
+    CONFIG = nf_module.CONFIG
+    base_name = CONFIG['base_name']
+
+    acc_pattern = re.compile(r"^acc_(\d+)p(\d+)percent_iter_\d+_" + re.escape(base_name) + r"\.pt$")
+    all_files = os.listdir(".")
+    pt_files = [f for f in all_files if acc_pattern.match(f)]
+
+    if pt_files:
+        closest_file = None
+        min_diff = float('inf')
+        best_acc = 0.0
+        for f in pt_files:
+            match = acc_pattern.match(f)
+            acc = float(f"{match.group(1)}.{match.group(2)}")
+            if abs(acc - 70.0) < min_diff:
+                min_diff, closest_file, best_acc = abs(acc - 70.0), f, acc
+        return closest_file, best_acc, nf_module, CONFIG
+
+    raw_pattern = re.compile(r"^iter_(\d+)_" + re.escape(base_name) + r"\.pt$")
+    raw_files = []
+    for f in all_files:
+        match = raw_pattern.match(f)
+        if match:
+            step = int(match.group(1))
+            if step <= 30000:
+                raw_files.append(f)
+
+    if not raw_files:
+        raise FileNotFoundError(f"L={L} 未能找到任何 30000 步以内且严格匹配 base_name '{base_name}' 的存档！")
+
+    print(f"  [🔍 L={L}] 锁定 {len(raw_files)} 个 30000 步以内的 iter_ 存档，开始快速评测...")
+
+    model = nf_module.FlowModel(CONFIG).to(DEVICE).to(torch.float64)
+    prior = nf_module.FreeFieldPrior(CONFIG['L'], CONFIG.get('m_sq_prior', 0.6005269985)).to(DEVICE).to(torch.float64)
+    action_fn = nf_module.compute_action
+
+    best_raw_file = None
+    min_diff = float('inf')
+    best_acc = 0.0
+    eval_samples = 20000
+
+    for raw_file in raw_files:
+        checkpoint = torch.load(raw_file, map_location=DEVICE, weights_only=False)
+        model.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()})
+        model.eval()
+
+        match = raw_pattern.match(raw_file)
+        step = int(match.group(1)) if match else 0
+        enforce_sym = CONFIG.get('enforce_z2_sym', False) and (step >= CONFIG.get('sym_start_iter', 0))
+
+        _, acc_rate = run_mcmc_chain(model, prior, action_fn, eval_samples,
+                                     min(CONFIG.get('batch_size', 10000), eval_samples), enforce_sym, L)
+        acc_percent = acc_rate * 100
+        diff = abs(acc_percent - 70.0)
+
+        print(f"    -> {raw_file} | 接受率: {acc_percent:.2f}% (离 70% 差 {diff:.2f}%)")
+
+        if diff < min_diff:
+            min_diff, best_raw_file, best_acc = diff, raw_file, acc_percent
+
+    acc_str = f"{best_acc:.2f}".replace('.', 'p')
+    new_name = f"acc_{acc_str}percent_{best_raw_file}"
+    shutil.copy2(best_raw_file, new_name)
+    print(f"  [✅ L={L}] 评估完成！最接近 70% 的模型已被存档为: {new_name}\n")
+
+    return new_name, best_acc, nf_module, CONFIG
+
+
+def generate_nf_mcmc_data(L, n_samples=1000000, batch_size=10000):
+    best_file, best_acc, nf_module, CONFIG = find_and_test_best_model(L)
+    print(f"  --> 🎯 [L={L}] 启动百万级生成，载入权重: {best_file}")
+
+    model = nf_module.FlowModel(CONFIG).to(DEVICE).to(torch.float64)
+    prior = nf_module.FreeFieldPrior(CONFIG['L'], CONFIG.get('m_sq_prior', 0.6005269985)).to(DEVICE).to(torch.float64)
+    checkpoint = torch.load(best_file, map_location=DEVICE, weights_only=False)
+    model.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()})
+    model.eval()
+
+    match = re.search(r"iter_(\d+)_", best_file)
+    step = int(match.group(1)) if match else 0
+    enforce_sym = CONFIG.get('enforce_z2_sym', False) and (step >= CONFIG.get('sym_start_iter', 0))
+
+    print(f"🚀 开始为 L={L} 产出 {n_samples} 真实 MCMC 样本...")
+    configurations, final_acc = run_mcmc_chain(model, prior, nf_module.compute_action, n_samples, batch_size,
+                                               enforce_sym, L)
+
+    output_filename = f"NF_configs_L{L}_N1000000_acc{best_acc:.1f}.npz"
     np.savez(f"./{output_filename}", configs=configurations)
-    print(f"✅ L={L} 的 NF 数据生成完毕，已固化保存至: {output_filename}\n")
+    print(f"✅ L={L} 生成完毕 (实际采样接受率: {final_acc:.2%})，保存至: {output_filename}\n")
     return configurations
 
 
 # ==========================================
-# 3. 物理可观测量与自相关时间 (Wolff 窗口法)
+# 4. 物理可观测量与自相关时间 (加入 Bootstrap 误差评估)
 # ==========================================
 def calculate_observables(configs):
-    """
-    高效计算磁化率 proxy (chi_2) 和 Ising-like 能量 (E) 序列
-    """
-    # 🌟 新增：防御性降维，兼容 (N, 1, L, L) 或 (N, L, L, 1) 的情况
+    configs = np.asarray(configs)
     if configs.ndim == 4:
-        configs = configs.reshape(configs.shape[0], configs.shape[-2], configs.shape[-1])
+        if configs.shape[1] == 1:
+            configs = configs[:, 0, :, :]
+        elif configs.shape[-1] == 1:
+            configs = configs[:, :, :, 0]
 
     _, L, _ = configs.shape
     V = L * L
+    d = 2
 
-    # 磁化率 chi_2 = M^2 / V
     M = np.sum(configs, axis=(1, 2))
-    chi2 = (M ** 2) / V
+    chi2_series = ((M - np.mean(M)) ** 2) / V
 
-    # 能量 E (最近邻项)
-    phi_x_right = np.roll(configs, shift=-1, axis=2)
-    phi_x_up = np.roll(configs, shift=-1, axis=1)
-    E = np.sum(configs * phi_x_right + configs * phi_x_up, axis=(1, 2)) / V
-    return chi2, E
+    phi_right = np.roll(configs, shift=-1, axis=2)
+    phi_up = np.roll(configs, shift=-1, axis=1)
+    G1_raw = np.sum(configs * phi_right, axis=(1, 2)) / V
+    G2_raw = np.sum(configs * phi_up, axis=(1, 2)) / V
+
+    phi_mean = np.mean(configs, axis=0)
+    G1_sub = np.sum(phi_mean * np.roll(phi_mean, shift=-1, axis=1)) / V
+    G2_sub = np.sum(phi_mean * np.roll(phi_mean, shift=-1, axis=0)) / V
+
+    E_series = ((G1_raw - G1_sub) + (G2_raw - G2_sub)) / d
+    Gc0_series = np.mean(configs ** 2, axis=(1, 2))
+
+    return E_series, chi2_series, Gc0_series
 
 
-def integrated_autocorr_time(x, c=5.0):
-    """
-    使用 Ulli Wolff 自动窗口法截断计算积分自相关时间
-    """
+def integrated_autocorr_time_with_error(x, c=5.0, n_boot=100, block_size=1000):
+    def calc_tau(ts):
+        N = len(ts)
+        ts = ts - np.mean(ts)
+        C0 = np.var(ts, ddof=1)
+        if C0 == 0: return 0.5
+        tau = 0.5
+        for t in range(1, N):
+            Ct = np.mean(ts[:N - t] * ts[t:])
+            rho_t = Ct / C0
+            tau += rho_t
+            if t >= c * tau: break
+        return max(0.5, tau)
+
+    tau_central = calc_tau(x)
+
     N = len(x)
-    x = x - np.mean(x)
-    C0 = np.var(x, ddof=1)
-    if C0 == 0: return 0.5
+    n_blocks = N // block_size
+    if n_blocks == 0: return tau_central, 0.0
 
-    tau_int = 0.5
-    for t in range(1, N):
-        Ct = np.mean(x[:N - t] * x[t:])
-        rho_t = Ct / C0
-        tau_int += rho_t
-        if t >= c * tau_int:  # Madras-Sokal 截断基准
-            break
-    return max(0.5, tau_int)
+    x_blocks = x[:n_blocks * block_size].reshape(n_blocks, block_size)
+    taus_boot = []
+
+    for _ in range(n_boot):
+        idx = np.random.randint(0, n_blocks, size=n_blocks)
+        boot_ts = x_blocks[idx].flatten()
+        taus_boot.append(calc_tau(boot_ts))
+
+    tau_err = np.std(taus_boot, ddof=1)
+    return tau_central, tau_err
 
 
 # ==========================================
-# 4. 主循环：读取、切片、计算与 Log-Log 绘图
+# 5. 主流程与独立的各算法绘图阶段
 # ==========================================
 def run_scaling_analysis():
     L_list = [6, 8, 10, 12, 14]
-    algorithms = ["Local", "HMC", "NF"]
+    algorithms = ["HMC", "Local", "NF"]
+    observables = ["E", "chi2", "Gc0"]
 
-    # 结果容器
-    results = {alg: {"chi2": [], "E": []} for alg in algorithms}
+    results = {alg: {obs: {"tau": [], "err": []} for obs in observables} for alg in algorithms}
 
     for alg in algorithms:
         for L in L_list:
             if alg == "NF":
-                # 检查本地是否有现成的 NF 1M 数据，没有则在线实时触发生成
-                filename = f"NF_configs_L{L}_N1000000_DTYPE_double.npz"
-                if not os.path.exists(filename):
+                nf_pattern = re.compile(rf"^NF_configs_L{L}_N1000000_acc\d+\.\d+\.npz$")
+                all_npz = os.listdir(".")
+                search_nf = [f for f in all_npz if nf_pattern.match(f)]
+
+                if not search_nf:
                     try:
                         configs = generate_nf_mcmc_data(L, n_samples=1000000)
                     except Exception as e:
-                        print(f"  [跳过] 无法在线生成 L={L} 的 NF 数据，原因: {e}")
-                        results[alg]["chi2"].append(np.nan)
-                        results[alg]["E"].append(np.nan)
+                        print(f"  [跳过] L={L} 流程崩溃: {e}")
+                        for obs in observables:
+                            results[alg][obs]["tau"].append(np.nan)
+                            results[alg][obs]["err"].append(np.nan)
                         continue
                 else:
-                    print(f"  加载现有数据: {filename}")
-                    data = np.load(filename)
-                    configs = data['configs']
+                    filename = search_nf[0]
+                    print(f"  加载现成数据: {filename}")
+                    configs = np.load(filename)['configs']
             else:
-                # Local 与 HMC 原始文件包含 1,280,000 个数据
                 filename = f"{alg}_configs_L{L}_N1280000_DTYPE_double.npz"
                 if os.path.exists(filename):
-                    print(f"  加载数据并严格切片 [0:1000000]: {filename}")
+                    print(f"  加载传统算法 [0:1000000]: {filename}")
                     data = np.load(filename)
-                    # 兼容不同写入 key 值的读取
-                    raw_configs = data['configs'] if 'configs' in data else data['arr_0']
-                    # 🌟 关键点：丢弃后 280,000 个，只截取前 1,000,000 个
-                    configs = raw_configs[:1000000]
+                    configs = (data['configs'] if 'configs' in data else data['arr_0'])[:1000000]
                 else:
-                    print(f"  [警告] 未能找到文件: {filename}")
-                    results[alg]["chi2"].append(np.nan)
-                    results[alg]["E"].append(np.nan)
+                    print(f"  [警告] 缺失文件: {filename}")
+                    for obs in observables:
+                        results[alg][obs]["tau"].append(np.nan)
+                        results[alg][obs]["err"].append(np.nan)
                     continue
 
-            # 计算对应的热力学可观测量序列
-            chi2_series, E_series = calculate_observables(configs)
+            for s_idx, s_data in enumerate(calculate_observables(configs)):
+                obs = observables[s_idx]
+                tau, err = integrated_autocorr_time_with_error(s_data)
+                results[alg][obs]["tau"].append(tau)
+                results[alg][obs]["err"].append(err)
 
-            # 统计计算自相关时间
-            tau_chi2 = integrated_autocorr_time(chi2_series)
-            tau_E = integrated_autocorr_time(E_series)
+            print(f"    --> {alg} L={L} 计算完毕")
 
-            results[alg]["chi2"].append(tau_chi2)
-            results[alg]["E"].append(tau_E)
-            print(f"    --> {alg} (L={L}): \\tau_int(chi2) = {tau_chi2:.2f}, \\tau_int(E) = {tau_E:.2f}")
-
-    # --- 动态学术图表绘制阶段 ---
+    # --- 独立绘图阶段 ---
     plt.style.use(PLOT_CONFIG["style"])
-    fig, axes = plt.subplots(1, 2, figsize=PLOT_CONFIG["figure_size"], dpi=PLOT_CONFIG["dpi"])
+    fit_equations = []
+    clean_formatter = FuncFormatter(lambda val, pos: f"{val:g}")
 
-    def plot_sub_panel(ax, obs_key, cfg_axes):
-        ax.set_title(cfg_axes["title"], fontsize=PLOT_CONFIG["fontsize_title"])
-        ax.set_xlabel(cfg_axes["xlabel"], fontsize=PLOT_CONFIG["fontsize_label"])
-        ax.set_ylabel(cfg_axes["ylabel"], fontsize=PLOT_CONFIG["fontsize_label"])
+    print("\n🎨 开始渲染分离图表...")
 
-        # 强制切换为标准双对数（Log-log）坐标轴
+    for alg in algorithms:
+        # 每次循环创建一张全新的独立图表
+        fig, ax = plt.subplots(figsize=PLOT_CONFIG["figure_size"], dpi=PLOT_CONFIG["dpi"])
+
+        ax.set_facecolor('white')
+        fig.patch.set_facecolor('white')
+
+        ax.set_ylabel(r"$\tau_{\mathrm{int}}$", fontsize=PLOT_CONFIG["fontsize_label"], rotation=0, labelpad=20)
+        ax.set_xlabel(r"$L$", fontsize=PLOT_CONFIG["fontsize_label"], labelpad=5)
+
         ax.set_xscale("log", base=10)
         ax.set_yscale("log", base=10)
 
-        # 应用用户自定义的坐标轴区间限制
-        if cfg_axes["x_limits"]: ax.set_xlim(cfg_axes["x_limits"])
-        if cfg_axes["y_limits"]: ax.set_ylim(cfg_axes["y_limits"])
+        # 严格的边界裁切
+        ax.set_xlim(PLOT_CONFIG["x_limits"])
+        ax.set_ylim(PLOT_CONFIG["y_limits"])
 
-        # 优化刻度展现形式：使 X 轴上的标度直接显示离散的晶格尺寸数值而非科学计数法
-        ax.set_xticks(L_list)
-        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
-        ax.tick_params(labelsize=PLOT_CONFIG["fontsize_tick"])
+        # 严格的数字刻度
+        ax.set_xticks(PLOT_CONFIG["x_ticks"])
+        ax.set_yticks(PLOT_CONFIG["y_ticks"])
+        ax.get_xaxis().set_major_formatter(clean_formatter)
+        ax.get_yaxis().set_major_formatter(clean_formatter)
 
-        for alg in algorithms:
-            y_data = np.array(results[alg][obs_key])
+        # 抹杀默认的副刻度（杂乱小竖线）
+        ax.xaxis.set_minor_locator(NullLocator())
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        # 核心修改：direction='in' 让刻度朝内，top=True, right=True 让四周都有刻度框
+        # 核心修复：通过 which='both' 强制把 Y 轴的主、副刻度统统按回框内！
+        ax.tick_params(which='both', direction='in',
+                       # top=True,
+                       # right=True
+                       )
+        # 主刻度样式
+        ax.tick_params(which='major', labelsize=PLOT_CONFIG["fontsize_tick"], length=6, width=1.2)
+        # 副刻度样式（稍微短一点，更美观）
+        ax.tick_params(which='minor', length=3, width=1.0)
+
+        color = PLOT_CONFIG["colors"][alg]
+
+        for obs in observables:
+            y_data = np.array(results[alg][obs]["tau"])
+            y_err = np.array(results[alg][obs]["err"])
+
             valid_mask = ~np.isnan(y_data)
             if np.sum(valid_mask) == 0: continue
 
             x_plot = np.array(L_list)[valid_mask]
             y_plot = y_data[valid_mask]
-            style_cfg = PLOT_CONFIG["algorithms"][alg]
+            err_plot = y_err[valid_mask]
 
-            # 绘制真实观测离散点与实线
-            main_line, = ax.plot(x_plot, y_plot,
-                                 color=style_cfg["color"],
-                                 marker=style_cfg["marker"],
-                                 linestyle=style_cfg["linestyle"],
-                                 linewidth=style_cfg["linewidth"],
-                                 markersize=7,
-                                 label=style_cfg["label"])
+            # 纯粹的图例伪造法，不带误差棒的干净 marker
+            ax.plot([], [], marker=PLOT_CONFIG["markers"][obs], color=color, linestyle='',
+                    markersize=9, fillstyle='none', markeredgewidth=1.8, label=PLOT_CONFIG["labels"][obs])
 
-            # 自动拟合临界慢化指数 z (\tau = a * L^z)
-            if len(x_plot) >= 3:
-                popt = np.polyfit(np.log10(x_plot), np.log10(y_plot), 1)
-                z_exponent = popt[0]
+            # 真实画出数据与误差，但不挂靠图例标签
+            ax.errorbar(x_plot, y_plot, yerr=err_plot,
+                        marker=PLOT_CONFIG["markers"][obs], color=color, linestyle='',
+                        markersize=9, fillstyle='none', markeredgewidth=1.8,
+                        capsize=4, elinewidth=1.5)
 
-                # 绘制延长拟合虚线
-                fit_x = np.linspace(min(x_plot) * 0.95, max(x_plot) * 1.05, 100)
-                fit_y = (10 ** popt[1]) * (fit_x ** z_exponent)
-                ax.plot(fit_x, fit_y,
-                        color=style_cfg["color"],
-                        linestyle=PLOT_CONFIG["fit_line"]["linestyle"],
-                        linewidth=PLOT_CONFIG["fit_line"]["linewidth"],
-                        alpha=PLOT_CONFIG["fit_line"]["alpha"])
+            # L>=10 的物理极限拟合
+            fit_mask = x_plot >= 10
+            if np.sum(fit_mask) >= 2:
+                x_fit, y_fit = x_plot[fit_mask], y_plot[fit_mask]
+                popt, pcov = np.polyfit(np.log10(x_fit), np.log10(y_fit), 1, cov=True)
+                z, z_err = popt[0], np.sqrt(pcov[0, 0])
+                err_digit = int(round(z_err * 100))
 
-                # 更新图例，直接将动态拟合得到的临界指数 z 渲染至 label 内
-                main_line.set_label(f"{style_cfg['label']} ($z \\approx {z_exponent:.2f}$)")
+                fit_line_x = np.linspace(min(x_fit) * 0.95, max(x_fit) * 1.05, 50)
+                ax.plot(fit_line_x, (10 ** popt[1]) * (fit_line_x ** z), color="red", linestyle="--", linewidth=2.0)
 
-        ax.grid(True, which="both", ls="--", alpha=0.35)
-        ax.legend(fontsize=PLOT_CONFIG["fontsize_legend"], loc="upper left", frameon=True, edgecolor='gray')
+                text_z = f"L^{{{z:.2f}({err_digit})}}" if err_digit > 0 else f"L^{{{z:.2f}}}"
+                fit_equations.append(f"[{alg}] {obs}: {text_z}")
 
-    # 渲染左图 (\chi2) 和 右图 (E)
-    plot_sub_panel(axes[0], "chi2", PLOT_CONFIG["chi2"])
-    plot_sub_panel(axes[1], "E", PLOT_CONFIG["E"])
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
+        ax.legend(fontsize=PLOT_CONFIG["fontsize_legend"], loc="upper left", frameon=True, edgecolor='black',
+                  handletextpad=0.1)
 
-    plt.tight_layout()
-    output_img = "CSD_Scaling_1M_Comparison.png"
-    plt.savefig(output_img, bbox_inches='tight')
-    print(f"\n🎉 标度图表绘制成功！已导出高分辨率图像至: {output_img}")
-    plt.show()
+        plt.tight_layout()
+
+        # 独立导出保存
+        output_img = f"CSD_Scaling_Fig7_{alg}.png"
+        plt.savefig(output_img, bbox_inches='tight', facecolor='white')
+
+        # 保存完之后关闭画布，释放内存并防止后续绘制重叠
+        plt.close(fig)
+
+        print(f"  ✅ 单图已生成: {output_img}")
+
+    print("\n" + "=" * 40)
+    print("📊 拟合斜率数据 (供手动排版使用):")
+    print("=" * 40)
+    for eq in fit_equations:
+        print(eq)
+    print("=" * 40 + "\n")
 
 
 if __name__ == "__main__":
