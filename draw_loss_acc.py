@@ -31,21 +31,20 @@ CONFIG_FILES = [
 # ==========================================
 # 2. 📊 坐标轴范围控制中心 📊
 # ==========================================
-MAX_STEPS = 30000        # 全局最大读取步数
-MCMC_START = 10000       # MCMC 数据截取起点
+MAX_STEPS = 30000  # 全局最大读取步数
+MCMC_START = 10000  # MCMC 数据截取起点
 LOSS_ZOOM_START = 15000  # Loss 放大图数据截取起点
 
 # --- 图 1: MCMC 接受率图 ---
 XLIM_ACC = (10000, 30000)
 YLIM_ACC = (0, 100)
 
-# --- 图 2: 全局 Loss 图 ---
+# --- 图 2 & 图 3: 全局 Loss 图 ---
 XLIM_LOSS_GLOBAL = (0, 30000)
-YLIM_LOSS_GLOBAL = None
 
-# --- 图 3: 局部放大 Loss 图 ---
+# --- 图 3: 局部放大 Loss 图 (画中画) ---
 XLIM_LOSS_ZOOM = (15000, 30000)
-YLIM_LOSS_ZOOM = None # 可以根据实际数据调整 (-62.5, -61)
+YLIM_LOSS_ZOOM = None  # 可以根据实际数据调整
 
 # ==========================================
 # 3. 自动导入配置
@@ -64,10 +63,12 @@ for item in CONFIG_FILES:
     except ImportError as e:
         print(f"❌ 导入失败 {item['module']}: {e}")
 
+
 def smooth_data(data, window_size=500):
     if len(data) < window_size: return data
     window = np.ones(window_size) / window_size
     return np.convolve(data, window, mode='valid')
+
 
 def load_data_from_config(config, module_name):
     data = {"loss": None, "mcmc_steps": None, "acc": None}
@@ -109,6 +110,7 @@ def load_data_from_config(config, module_name):
 
     return data
 
+
 # ==========================================
 # 4. 绘图主程序
 # ==========================================
@@ -119,6 +121,9 @@ def plot_results():
         loaded_data.append((exp, data))
 
     print("\n📊 正在生成图表...")
+
+    # 降采样步长：专门为了解决密集数据点导致虚线连成实线的问题
+    DS_STEP = 50
 
     # ---------------------------------------------------------
     # 图 1: MCMC 接受率
@@ -157,21 +162,30 @@ def plot_results():
 
             smooth_loss = smooth_data(data["loss"])
             s_iters = np.arange(len(smooth_loss)) + (len(data["loss"]) - len(smooth_loss)) // 2
-            ax2.plot(s_iters, smooth_loss, color=exp["color"], linestyle=exp["linestyle"], label=exp["label"],
-                     linewidth=2)
+
+            # ====== 新增降采样切片 [::DS_STEP] ======
+            ax2.plot(s_iters[::DS_STEP], smooth_loss[::DS_STEP], color=exp["color"],
+                     linestyle=exp["linestyle"], label=exp["label"], linewidth=2)
+
+            start_loss = data["loss"][0]
+            ax2.plot(0, start_loss, marker='*', color=exp["color"], markersize=10, markeredgecolor='black', zorder=5)
+
+            v_offset = [1.5, 0, -1.5][i] if i < 3 else 0
+            ax2.text(800, start_loss + v_offset, f"Start: {start_loss:.1f}", color=exp["color"],
+                     fontsize=10, fontweight='bold', va='center')
 
     ax2.set_title("Training Loss Comparison (0 - 30k Steps)", fontsize=14)
     ax2.set_xlabel("Steps", fontsize=12)
-    ax2.set_ylabel(r"Loss $= D_{\mathrm{KL}}$", fontsize=14)
+    ax2.set_ylabel(r"Loss $= \mathcal{L}(\theta)$", fontsize=14)
 
     if XLIM_LOSS_GLOBAL is not None: ax2.set_xlim(XLIM_LOSS_GLOBAL)
-    if YLIM_LOSS_GLOBAL is not None:
-        ax2.set_ylim(YLIM_LOSS_GLOBAL)
-    else:
-        ax2.set_yscale("symlog", linthresh=100.0)
 
+    ax2.set_ylim(bottom=-70)
+
+    ax2.ticklabel_format(style='plain', axis='y')
     ax2.grid(True, which="both", ls="--", alpha=0.4)
-    if has_loss_data: ax2.legend(fontsize=10, loc="upper right")
+
+    if has_loss_data: ax2.legend(fontsize=10, loc="lower left")
     fig2.tight_layout()
     fig2.savefig("plot_2_loss_global_comparison.png")
 
@@ -189,8 +203,17 @@ def plot_results():
 
             smooth_loss = smooth_data(data["loss"])
             s_iters = np.arange(len(smooth_loss)) + (len(data["loss"]) - len(smooth_loss)) // 2
-            ax4.plot(s_iters, smooth_loss, color=exp["color"], linestyle=exp["linestyle"], label=exp["label"],
-                     linewidth=2)
+
+            # ====== 新增降采样切片 [::DS_STEP] ======
+            ax4.plot(s_iters[::DS_STEP], smooth_loss[::DS_STEP], color=exp["color"],
+                     linestyle=exp["linestyle"], label=exp["label"], linewidth=2)
+
+            start_loss = data["loss"][0]
+            ax4.plot(0, start_loss, marker='*', color=exp["color"], markersize=10, markeredgecolor='black', zorder=5)
+
+            v_offset = [1.5, 0, -1.5][i] if i < 3 else 0
+            ax4.text(800, start_loss + v_offset, f"Start: {start_loss:.1f}", color=exp["color"],
+                     fontsize=10, fontweight='bold', va='center')
 
             # 2. 绘制画中画 (局部放大)
             if len(data["loss"]) > LOSS_ZOOM_START:
@@ -200,17 +223,20 @@ def plot_results():
 
                 smooth_zoom = smooth_data(zoom_loss, window_size=200)
                 s_zoom_iters = np.arange(len(smooth_zoom)) + LOSS_ZOOM_START + (len(zoom_loss) - len(smooth_zoom)) // 2
-                axins.plot(s_zoom_iters, smooth_zoom, color=exp["color"], linestyle=exp["linestyle"], linewidth=2)
+
+                # ====== 核心修复：画中画平滑线降采样 ======
+                axins.plot(s_zoom_iters[::DS_STEP], smooth_zoom[::DS_STEP], color=exp["color"],
+                           linestyle=exp["linestyle"], linewidth=2)
 
     ax4.set_title("Training Loss with Local Zoom", fontsize=14)
     ax4.set_xlabel("Steps", fontsize=12)
-    ax4.set_ylabel(r"Loss $= D_{\mathrm{KL}}$", fontsize=14)
+    ax4.set_ylabel(r"Loss $= \mathcal{L}(\theta)$", fontsize=14)
 
     if XLIM_LOSS_GLOBAL is not None: ax4.set_xlim(XLIM_LOSS_GLOBAL)
-    if YLIM_LOSS_GLOBAL is not None:
-        ax4.set_ylim(YLIM_LOSS_GLOBAL)
-    else:
-        ax4.set_yscale("symlog", linthresh=100.0)
+
+    ax4.set_ylim(bottom=-70)
+
+    ax4.ticklabel_format(style='plain', axis='y')
     ax4.grid(True, which="both", ls="--", alpha=0.4)
 
     if has_loss_data:
@@ -218,6 +244,8 @@ def plot_results():
 
     if XLIM_LOSS_ZOOM is not None: axins.set_xlim(XLIM_LOSS_ZOOM)
     if YLIM_LOSS_ZOOM is not None: axins.set_ylim(YLIM_LOSS_ZOOM)
+
+    axins.ticklabel_format(style='plain', axis='y')
     axins.tick_params(labelleft=True, labelbottom=True)
     axins.grid(True, ls="--", alpha=0.4)
 
@@ -230,6 +258,7 @@ def plot_results():
     print("   -> 图1: MCMC 接受率对比 (plot_1_acc_comparison.png)")
     print("   -> 图2: Loss 全局对比图 (plot_2_loss_global_comparison.png)")
     print("   -> 图3: 画中画复合对比图 (plot_3_loss_inset_comparison.png)")
+
 
 if __name__ == "__main__":
     plot_results()

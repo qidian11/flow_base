@@ -6,6 +6,7 @@ import os
 # 严格按照 Albergo 原论文公式 (25) 和 (26) 的计算与排版
 # ==========================================
 
+tick_labels = [r'$6^2$', r'$8^2$', r'$10^2$', r'$12^2$', r'$14^2$']
 L_list = [6, 8, 10, 12, 14]
 algorithms = ["Local", "HMC", "NF"]
 N_samples = 1000000
@@ -137,11 +138,13 @@ for alg in plot_order:
 axes[0].set_ylabel(r"Susceptibility $\chi_2$", fontsize=14)
 axes[0].set_xlabel(r"$L$", fontsize=14)
 axes[0].set_xticks(L_list)
+axes[0].set_xticklabels(tick_labels)
 axes[0].legend(fontsize=12, loc="upper left", frameon=False)
 
 axes[1].set_ylabel(r"Ising energy $E$", fontsize=14)
-axes[1].set_xlabel(r"$L$", fontsize=14)
+axes[1].set_xlabel(r"$V$", fontsize=14)
 axes[1].set_xticks(L_list)
+axes[1].set_xticklabels(tick_labels)
 
 # 学术规范：刻度朝内
 for ax in axes:

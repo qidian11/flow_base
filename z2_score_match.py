@@ -88,7 +88,7 @@ def auto_find_latest_checkpoint(config):
 # ==========================================
 CONFIG = {
     # 'type': 'shared_trunk_prior_cnn8_m_free',
-    'type': 'final_normalizing_32_abs',
+    'type': 'score_match_z2_32',
     'L': 14,
     'm_sq': -4.0,
     'lam': 5.113,
@@ -726,8 +726,8 @@ def train():
 
     if hasattr(torch, 'compile') and device.type == 'cuda':
         model.train()
-        # compiled_model = torch.compile(model)
-        compiled_model = model
+        compiled_model = torch.compile(model)
+        # compiled_model = model
     else:
         compiled_model = model
 
@@ -735,78 +735,53 @@ def train():
     for iteration in range(start_iteration, CONFIG['iterations'] + 1):
         optimizer.zero_grad()
 
-        # 1. 采样物理场，并显式开启梯度追踪
-        z_phys_raw, _ = prior.sample(CONFIG['batch_size'])
-        z_phys = z_phys_raw.detach().requires_grad_(True)
-        log_p_z = prior.log_prob(z_phys)
-
-        # ❌ 删掉随机 g_x 的生成！
-        # 既然是标准 CNN，就绝不能喂给它被 g 打碎的白噪声！
+        # ==========================================
+        # 🏎️ 极速通道 (主干 KL 散度，大 Batch=1024)
+        # ==========================================
+        # 1. 采样物理场 (注意：这里不需要开启梯度追踪，极省显存)
+        z_phys, log_p_z = prior.sample(CONFIG['batch_size'])
 
         warmup_steps = CONFIG['warmup_steps']
         progress_val = min(iteration / warmup_steps, 1.0)
         model.step_warmup(progress_val)
         progress_tensor = torch.tensor(progress_val, device=device, dtype=dtype)
 
-        # 🌟 关闭所有硬约束，让满血 CNN 放飞自我
-        enforce_sym = False
-
-        # 2. 🌟 直接把平滑的物理先验喂给模型
-        # 因为没有 g，这里输出的直接就是物理场 phi
-        phi, log_det_J = compiled_model(z_phys, progress_tensor, enforce_sym=enforce_sym)
+        # 2. 用 compiled_model 极速前向传播
+        phi, log_det_J = compiled_model(z_phys, progress_tensor, enforce_sym=False)
 
         # 3. 计算 KL Loss
         S_phi = compute_action(phi)
-        A = S_phi + log_p_z - log_det_J
-        loss_kl = torch.mean(A)
+        loss_kl = torch.mean(S_phi + log_p_z - log_det_J)
 
-        # 4. 🌟 Score Matching 核心：拉回至 z 空间的受力残差
+        # ==========================================
+        # 🧠 动力学通道 (Force Matching，微批次 Micro-Batch)
+        # ==========================================
+        # 🌟 黑魔法 1：只抽取前 128 个样本算二阶导数，算力开销瞬间暴降 87.5%！
+        force_bs = 128
+        # 切片出小批次，并独立开启梯度追踪
+        z_force = z_phys[:force_bs].detach().requires_grad_(True)
+        log_p_z_force = prior.log_prob(z_force)
+
+        # 🌟 黑魔法 2：用原生 model (不用 compiled_model) 绕过编译器双重求导的 Bug！
+        phi_force, log_det_J_force = model(z_force, progress_tensor, enforce_sym=False)
+
+        A_force = compute_action(phi_force) + log_p_z_force - log_det_J_force
+
         force_residual_z = torch.autograd.grad(
-            outputs=A.sum(),
-            inputs=z_phys,
+            outputs=A_force.sum(),
+            inputs=z_force,
             create_graph=True,
             retain_graph=True
         )[0]
 
-        # 广延量对齐：空间维度求和，Batch 维度求平均
         loss_force = torch.mean(torch.sum(force_residual_z ** 2, dim=(1, 2, 3)))
 
-        # ----------------------------------------------------
-        # 🌟 梯度平衡探测器 (Gradient Balancing Detector)
-        # 注意：探测梯度会稍微增加计算时间，找到合适的 lambda 后可以把这段注释掉
-        # ----------------------------------------------------
+        # ==========================================
+        # 🎯 联合反向传播
+        # ==========================================
+        lambda_force = CONFIG.get('lambda_force', 0.01)
 
-        # 1. 探测 KL Loss 对网络权重的梯度大小
-        optimizer.zero_grad()
-        loss_kl.backward(retain_graph=True)
-        kl_grad_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                kl_grad_norm += p.grad.data.norm(2).item() ** 2
-        kl_grad_norm = kl_grad_norm ** 0.5
-
-        # 2. 探测 Force Loss 对网络权重的梯度大小
-        optimizer.zero_grad()
-        loss_force.backward(retain_graph=True)
-        force_grad_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                force_grad_norm += p.grad.data.norm(2).item() ** 2
-        force_grad_norm = force_grad_norm ** 0.5
-
-        optimizer.zero_grad()  # 探测完毕，清空梯度
-
-        # 3. 计算理想的 lambda 指导值 (让两者梯度 1:1 等大)
-        ideal_lambda = kl_grad_norm / (force_grad_norm + 1e-8)
-
-        if iteration % 10 == 0:
-            print(f"[梯度探测] KL 梯度大小: {kl_grad_norm:.4f} | Force 梯度大小: {force_grad_norm:.4f}")
-            print(f"👉 建议的 lambda 基础值应在 {ideal_lambda:.6f} 附近")
-
-        # ----------------------------------------------------
-        # 真正用于更新的联合 Loss
-        # ----------------------------------------------------
-        lambda_force = CONFIG.get('lambda_force', 0.001)  # 你可以在 CONFIG 里试探性地填入上面探测出的理想值
+        # PyTorch 底层会自动将 compiled_model 和 model 共享的权重梯度完美合并！
         loss = loss_kl + lambda_force * loss_force
         loss.backward()
 
@@ -849,8 +824,6 @@ def train():
         ema_loss = loss_val if ema_loss is None else 0.95 * ema_loss + 0.05 * loss_val
 
         if iteration % 100 == 0:
-            # 🌟 新增：判断当前 Z_2 对称性是否处于开启状态
-            z2_status = "ON" if enforce_sym else "OFF"
 
             print(
                 f"迭代 {iteration:6d}/{CONFIG['iterations']} "
@@ -921,8 +894,7 @@ def train():
 
             # 🌟 修改：接收多出来的期望值和误差
             acc_rate, phi_means, phi_errs = run_mcmc_evaluation(
-                compiled_model, prior, total_n=total_n, batch_size=CONFIG['batch_size'],
-                enforce_sym=enforce_sym
+                compiled_model, prior, total_n=total_n, batch_size=CONFIG['batch_size']
             )
 
             print(f"📊 当前物理接受率: {acc_rate:.2%}")
